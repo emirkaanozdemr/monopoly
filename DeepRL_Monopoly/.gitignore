@@ -3,3 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+
+# Instrumented-trace corpus (111 MB, regenerable via trace_run.py); the
+# pre-registration and split declarations stay tracked as audit evidence.
+competition_agent/traces/*
+!competition_agent/traces/SPLIT.md
+!competition_agent/traces/GAPS_prereg.md
