@@ -38,6 +38,7 @@ SUPPORTED_SCRIPTED = tuple(f"fixed-{letter}" for letter in "abcdef")
 SUPPORTED_ASU = ("asu-value-v1", "asu-rollout-v1")
 SUPPORTED_SLAYER = ("slayer-v1", "slayer-rollout-v1")
 CHECKPOINT_KINDS = ("ppo", "ddqn", "cfr")
+SUBMISSION_KIND = "submission"
 DEFAULT_MAX_DECISIONS = 20_000
 RESULTS_DISCLAIMER = (
     "These are ppo-plus-v2 simulator results for ASU-inspired reconstructions; "
@@ -64,6 +65,13 @@ def parse_agent_spec(value: str) -> AgentSpec:
         return AgentSpec(normalized, normalized)
     for separator in (":", "="):
         kind, found, path_text = normalized.partition(separator)
+        if found and kind == SUBMISSION_KIND:
+            if not path_text:
+                raise ValueError("submission requires an explicit checkout directory")
+            checkout = Path(path_text).expanduser().resolve()
+            if not checkout.is_dir():
+                raise ValueError(f"Missing submission checkout: {checkout}")
+            return AgentSpec(kind, f"{kind}:{checkout}", checkout)
         if found and kind in CHECKPOINT_KINDS:
             if not path_text:
                 raise ValueError(f"{kind} requires an explicit checkpoint path")
@@ -74,7 +82,7 @@ def parse_agent_spec(value: str) -> AgentSpec:
     supported = ", ".join((*SUPPORTED_ASU, *SUPPORTED_SLAYER, *SUPPORTED_SCRIPTED))
     raise ValueError(
         f"Unknown agent spec {value!r}; use {supported}, or ppo:/path, "
-        "ddqn:/path, cfr:/path"
+        "ddqn:/path, cfr:/path, submission:/checkout"
     )
 
 
@@ -84,6 +92,33 @@ def checkpoint_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def tree_sha256(root: Path, exclude: tuple[str, ...] = (".git", "__pycache__")) -> str:
+    """Order-independent digest of a checkout, so a run records what it scored."""
+
+    digest = hashlib.sha256()
+    root = Path(root)
+    paths = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and not any(part in exclude for part in path.relative_to(root).parts)
+    )
+    for path in paths:
+        digest.update(str(path.relative_to(root).as_posix()).encode())
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def artifact_sha256(path: Path) -> str:
+    """Digest a checkpoint file or a submission checkout directory."""
+
+    return tree_sha256(path) if path.is_dir() else checkpoint_sha256(path)
 
 
 def wilson_interval(wins: int, games: int) -> tuple[float, float]:
@@ -303,6 +338,14 @@ class AgentFactory:
             from ASU_SLAYER.search import SlayerRolloutV1
 
             return SlayerRolloutV1(player_id)
+        if spec.kind == SUBMISSION_KIND:
+            from submission.contract import bind_seat, load_module
+
+            assert spec.checkpoint is not None
+            key = (spec.kind, spec.checkpoint)
+            if key not in self._loaded:
+                self._loaded[key] = load_module(spec.checkpoint)
+            return bind_seat(self._loaded[key], player_id)
         if spec.kind in SUPPORTED_SCRIPTED:
             agent = FP_AGENT_CLASSES[ord(spec.kind[-1]) - ord("a")](player_id)
             return _ScriptedAdapter(agent, player_id)
@@ -444,7 +487,7 @@ def evaluate_lineup(
 
     all_specs = (focus_spec, *opponent_specs)
     hashes = {
-        spec.policy_id: checkpoint_sha256(spec.checkpoint)
+        spec.policy_id: artifact_sha256(spec.checkpoint)
         for spec in all_specs
         if spec.checkpoint is not None
     }
