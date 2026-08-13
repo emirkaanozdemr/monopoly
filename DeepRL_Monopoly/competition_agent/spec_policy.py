@@ -54,6 +54,10 @@ TRADE_W = {
 }
 TRADE_GATE = float(os.environ.get("TRADE_GATE", "3.92"))
 
+# gap/arm-b — intervention switch (INTERVENTIONS.md). Inert unless
+# GAP_ARM=B is set in the environment before import.
+GAP_ARM = os.environ.get("GAP_ARM", "")
+
 # Optional override, for A/B-ing a re-fitted scorer against the shipped one
 # without editing the frozen agent. Points at a JSON file holding
 # {"weights": {feature: weight, ...}, "gate": <float>}; any feature named in
@@ -217,6 +221,7 @@ class SpecPolicy:
 
     def __init__(self, player_id: int, rng_seed: int = 0):
         self.player_id = player_id
+        self.gap_fires = 0    # gap/arm-b: times the intervention fired
 
     # ------------------------------------------------------------------
     def choose_action(self, env) -> int:
@@ -374,6 +379,18 @@ class SpecPolicy:
         offer = env._incoming_trade(pid)
         if offer is None:
             return None
+
+        # gap/arm-b — kill the churn loop. BUGS.md: 38,120 cyclic re-trades,
+        # accepted offers median net list-value 0. Reject any offer whose
+        # net list-value is <= 0; positive-value handling below untouched.
+        if GAP_ARM == "B":
+            npv = ((offer.offered_prop.price if offer.offered_prop else 0)
+                   + offer.cash_offered
+                   - (offer.requested_prop.price if offer.requested_prop else 0)
+                   - offer.cash_requested)
+            if npv <= 0:
+                self.gap_fires += 1
+                return DECLINE_TRADE
 
         gain = 0.0
         if offer.offered_prop is not None:
