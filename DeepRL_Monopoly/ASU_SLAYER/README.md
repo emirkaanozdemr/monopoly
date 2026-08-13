@@ -1,11 +1,27 @@
 # ASU_SLAYER — a net-worth-exact challenger
 
 `ASU_SLAYER` is a search policy for this repository's `ppo-plus-v2` simulator,
-built to beat `ASU_FROZEN_TEACHER`. It contains no learned weights and needs no
-training: the entire edge comes from optimizing the quantity the simulator
-actually ranks players by.
+built to challenge `ASU_FROZEN_TEACHER`. It contains no learned weights and
+needs no training: the entire edge comes from optimizing the quantity the
+simulator actually ranks players by.
 
-## Why it beats the frozen teacher
+## Measured status (seat-balanced, natural game end, Wilson 95% CI)
+
+| Lineup | slayer-v1 | Reference |
+| --- | --- | --- |
+| vs fixed-b/d/e, n=2000 | **50.55%** [48.4, 52.7] | best prior agent 41.8%; parity 25% |
+| vs 3x asu-value-v1, n=120, hardened | **22.50%** [16.0, 30.8] | parity 25%; pre-hardening 15.0% |
+
+The net-worth-exact thesis wins clearly in the CAP regime (games decided by
+the round-200 net-worth ranking). Against three ASU teachers, games end by
+ELIMINATION, and the thesis alone was not enough: the original build scored
+15.0% [9.7, 22.5] with 85% bankruptcies — while completing a color group in
+64% of those games. The hardening pass below recovered +7.5pp (McNemar
+p=0.035 on paired seeds) by fixing the solvency machinery; the remaining gap
+to parity is an open problem, not a solved one. See SLAYER_REVIEW.md for the
+full audit.
+
+## The thesis: score in the engine's own units
 
 The engine decides a game two ways. Either one player is left standing, or the
 200-round cap is reached and `MonopolyEnv.winner()` picks the greatest
@@ -36,7 +52,9 @@ design (`ASU_FROZEN_TEACHER/spec.py`). That objective is a defensible reading
 of the ASU papers, but it is not the simulator's scoring rule: it undervalues a
 completed group, undervalues development, and prices cash at zero right up to
 the moment cash decides the game. The challenger scores every decision in the
-engine's own units instead.
+engine's own units instead. The measured caveat: in elimination-decided games
+the teacher's cash discipline beats raw net-worth maximization; scoring rule
+exactness decides capped games, solvency decides eliminated ones.
 
 ## Policies
 

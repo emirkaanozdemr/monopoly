@@ -186,3 +186,36 @@ pack büyükse erken red — kabul edilebilir ama bilinçli olmalı).
 4. `active_liquidation`'ı ASU sahasında aç/test et (§3b)
 5. Öneri spam'ine cool-down (§4.2)
 6. Submission harness'ına env-mutasyon denetimi (§6 — turnuva bütünlüğü)
+
+## 9. Uygulanan sertleştirme (bu PR) ve A/B doğrulaması
+
+Uygulanan düzeltmeler:
+- **3a**: `_affordable` artık `cost <= 0` işlemlerde rezerv şartı aramıyor
+  (bedava takas önerisi + kabulü serbest; repro artık ACCEPT veriyor).
+- **3b**: `active_liquidation` default **açık**; histerezisli —
+  `liquidation_trigger=0.85` altında nakit topla, unmortgage için
+  `unmortgage_headroom=1.25` üstü şart (ping-pong kapalı).
+- **4.1**: rezerv ufku artık "kalan beklenen uzunluk":
+  `min(expected_game_length, 200 − round)` — tur-45 sonrası `min_horizon`'a
+  çakılma kalktı; kantil oyun sonuna dek ~0.992'de sabit, gerçek sonda gevşiyor.
+- **4.2**: takas önerisine `proposal_cooldown_rounds=10` — aynı öneri 10 tur
+  içinde tekrarlanmıyor.
+- **4.4**: rollout seed'leri karar bağlamıyla tuzlanıyor (aday-içi CRN korunarak
+  karar-arası zar korelasyonu kırıldı).
+- **4.6/4.7**: kalan tüm config alanlarına doğrulama; `trade_margin > 0` şartı.
+- **4.8**: income/luxury tax `rent_quantile` dağılımına girdi.
+- **6**: `submission/contract.py`'a `_env_fingerprint` tabanlı
+  **EnvironmentMutationError** — `env` enjekte edilen submission'ların cash/
+  ownership/ev/trade/faz mutasyonu artık karar başına yakalanıyor (birim test:
+  rakibin nakdini sıfırlayan ajan yakalandı, dürüst ajan geçti).
+
+A/B (orijinal vs sertleştirilmiş, aynı seed'ler, eşleştirilmiş):
+
+| Saha | Orijinal | Sertleştirilmiş | Eşleştirilmiş Δ | p |
+|---|---|---|---|---|
+| fixed-b/d/e (n=2000) | 50.55% | 49.45% | −1.10pp [−3.00, +0.85] | 0.28 (fark yok) |
+| 3× asu-value-v1 (n=120) | 15.00% | **22.50%** | **+7.50pp** [+1.67, +14.17] | **0.035** |
+
+Teacher sahasında iflas %85 → %77.5, full_group %64 → %74. Kalan parite açığı
+(≈2.5pp) rezerv mekanizmasının ötesinde bir sorun — muhtemelen erken-oyun
+aşırı-yayılma; README'deki iddia ölçülen gerçeğe çekildi.
