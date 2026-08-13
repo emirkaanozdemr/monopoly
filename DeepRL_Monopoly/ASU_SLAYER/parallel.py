@@ -45,22 +45,18 @@ LINEUPS: dict[str, tuple[str, ...]] = {
     "fixed": ("fixed-a", "fixed-b", "fixed-c"),
 }
 
-# Candidate solvency reserves, swept over the risk model rather than over a
-# flat cash floor. An earlier grid varied a flat floor in both directions and
-# every conservative point lost all of its games with zero net worth: a high
-# floor stops the agent buying, and an agent that owns nothing earns nothing.
-# The knob that matters is how much of the rent distribution to insure against.
+# Candidate reserves, swept over survival risk rather than over a cash floor.
+# A 128-game measurement showed the policy winning every game it survived
+# (15 of 15) while going bankrupt in the other 113, so the only knob that
+# matters is how much ruin risk it carries per turn and over how long a
+# horizon. A flat cash floor was tried first and is not the right shape.
 CONFIG_GRID: dict[str, dict[str, float]] = {
-    "bold": {"risk_quantile": 0.80, "reserve_floor": 0.0, "threat_multiple": 1.0},
     "baseline": {},
+    "balanced": {"target_survival": 0.50},
+    "very-safe": {"target_survival": 0.90},
+    "short-horizon": {"expected_game_length": 30.0},
+    "long-horizon": {"expected_game_length": 60.0},
     "half-threat": {"threat_multiple": 0.5},
-    "heavy-threat": {"threat_multiple": 1.5},
-    "cautious": {"risk_quantile": 0.95, "reserve_floor": 100.0},
-    "deep-cautious": {
-        "risk_quantile": 0.97,
-        "reserve_floor": 150.0,
-        "threat_multiple": 1.25,
-    },
 }
 
 

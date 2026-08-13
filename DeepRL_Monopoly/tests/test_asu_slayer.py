@@ -8,11 +8,18 @@ from ASU_FROZEN_TEACHER.evaluate import (
     _new_seeded_game,
     parse_agent_spec,
 )
-from ASU_SLAYER.board import exposure, landings, rent_at, rent_quantile
+from ASU_SLAYER.board import (
+    exposure,
+    income_by_square,
+    landings,
+    rent_at,
+    rent_quantile,
+)
 from ASU_SLAYER.policy import DEFAULT_CONFIG, SlayerV1
 from ASU_SLAYER.scoring import (
     acquisition_gain,
     deed_worth,
+    development_outlook,
     disposal_loss,
     improvement_gain,
     liquidation_options,
@@ -312,6 +319,70 @@ class ReserveTest(unittest.TestCase):
             self.assertLessEqual(value, worst)
             previous = value
 
+    def test_quantile_compounds_to_the_survival_target(self):
+        """The whole point: q ** horizon must equal the survival target.
+
+        A flat 0.90 per turn reads as safe and is not — over the ~45 turns a
+        game actually lasts it compounds to under 1% survival, which is what
+        bankrupted the policy in 113 of 128 measured games.
+        """
+
+        env = fresh_env()
+        agent = SlayerV1(0)
+        config = agent.config
+        env.round = 0
+        quantile = agent._survival_quantile(env)
+        horizon = config.expected_game_length
+        self.assertAlmostEqual(quantile**horizon, config.target_survival, places=6)
+        self.assertGreater(quantile, 0.99)
+
+    def test_quantile_relaxes_as_the_game_runs_out(self):
+        """Fewer turns left means fewer chances to be ruined, so risk more."""
+
+        env = fresh_env()
+        agent = SlayerV1(0)
+        previous = 1.0
+        for round_number in (0, 10, 20, 30, 40, 44):
+            env.round = round_number
+            quantile = agent._survival_quantile(env)
+            self.assertLess(quantile, previous)
+            self.assertTrue(0.0 < quantile < 1.0)
+            previous = quantile
+
+    def test_quantile_stays_valid_past_the_expected_game_length(self):
+        """A long game must not drive the horizon to zero or the quantile out of range."""
+
+        env = fresh_env()
+        agent = SlayerV1(0)
+        for round_number in (44, 45, 60, 199, 200):
+            env.round = round_number
+            quantile = agent._survival_quantile(env)
+            self.assertTrue(0.0 < quantile < 1.0, f"round={round_number}")
+            # The floor on the horizon pins the late-game quantile.
+            self.assertAlmostEqual(
+                quantile,
+                agent.config.target_survival ** (1.0 / agent.config.min_horizon),
+                places=9,
+            )
+
+    def test_a_longer_expected_game_demands_a_stricter_quantile(self):
+        env = fresh_env()
+        short = SlayerV1(0, DEFAULT_CONFIG.evolve(expected_game_length=30.0))
+        long = SlayerV1(0, DEFAULT_CONFIG.evolve(expected_game_length=60.0))
+        self.assertLess(short._survival_quantile(env), long._survival_quantile(env))
+
+    def test_configuration_rejects_impossible_settings(self):
+        for changes in (
+            {"target_survival": 0.0},
+            {"target_survival": 1.0},
+            {"target_survival": -0.5},
+            {"min_horizon": 0.0},
+            {"expected_game_length": 0.0},
+            {"threat_multiple": -1.0},
+        ):
+            with self.assertRaises(ValueError, msg=str(changes)):
+                DEFAULT_CONFIG.evolve(**changes)
+
     def test_empty_board_reserve_does_not_block_the_first_purchase(self):
         """The old design added a flat reserve while deeds were unowned."""
 
@@ -336,6 +407,157 @@ class ReserveTest(unittest.TestCase):
             env.players[0].properties.append(prop)
         # Owning mortgageable deeds must not unlock spending we cannot fund.
         self.assertFalse(agent._affordable(env, 0.0, reserve))
+
+
+class DevelopmentOutlookTest(unittest.TestCase):
+    """Concentration: a deed we can never build on is not worth list price."""
+
+    def test_outlook_is_full_while_the_group_is_still_winnable(self):
+        env = fresh_env()
+        group = COLOR_GROUPS["orange"]
+        self.assertEqual(development_outlook(env, 0, group[0]), 1.0)
+        env.properties[group[1]].owner = 0
+        self.assertEqual(development_outlook(env, 0, group[0]), 1.0)
+
+    def test_outlook_collapses_once_an_opponent_enters_the_group(self):
+        env = fresh_env()
+        group = COLOR_GROUPS["orange"]
+        env.properties[group[1]].owner = 1
+        self.assertLess(development_outlook(env, 0, group[0]), 1.0)
+
+    def test_railroads_and_utilities_are_exempt(self):
+        """Their rent scales with the count held, so partial ownership earns."""
+
+        env = fresh_env()
+        for colour in ("railroad", "utility"):
+            group = COLOR_GROUPS[colour]
+            env.properties[group[1]].owner = 1
+            self.assertEqual(development_outlook(env, 0, group[0]), 1.0)
+
+    def test_a_blocked_deed_is_valued_below_a_winnable_one(self):
+        env = fresh_env()
+        seat = 0
+        winnable = COLOR_GROUPS["orange"][0]
+        blocked = COLOR_GROUPS["red"][0]
+        env.properties[COLOR_GROUPS["red"][1]].owner = 1
+        env.players[1].properties.append(env.properties[COLOR_GROUPS["red"][1]])
+        agent = SlayerV1(seat)
+        self.assertGreater(
+            agent._acquire_value(env, winnable), agent._acquire_value(env, blocked)
+        )
+
+    def test_still_buys_into_a_group_nobody_else_has_entered(self):
+        env = fresh_env()
+        seat = env.active_player_id()
+        env.phase = "post_roll"
+        env.has_rolled = True
+        env.players[seat].position = COLOR_GROUPS["orange"][0]
+        self.assertEqual(
+            SlayerV1(seat).choose_action(env), int(ActionType.BUY_PROPERTY)
+        )
+
+
+class ActiveLiquidationTest(unittest.TestCase):
+    """Refusing to spend cannot recover cash; only raising it can."""
+
+    def _threatened(self):
+        """Us cash-poor and holding deeds, an opponent with a developed group."""
+
+        env = fresh_env()
+        seat = env.active_player_id()
+        rival = (seat + 1) % 4
+        for square in COLOR_GROUPS["orange"]:
+            prop = env.properties[square]
+            prop.owner = rival
+            env.players[rival].properties.append(prop)
+        env._update_monopolies()
+        for square in COLOR_GROUPS["orange"]:
+            env.properties[square].houses = 4
+        env.players[seat].position = 13  # oranges are a roll away
+        env.players[seat].cash = 60
+        return env, seat
+
+    def _give(self, env, seat, squares):
+        for square in squares:
+            prop = env.properties[square]
+            prop.owner = seat
+            env.players[seat].properties.append(prop)
+        env._update_monopolies()
+
+    def test_mortgages_when_cash_is_under_the_reserve(self):
+        env, seat = self._threatened()
+        self._give(env, seat, [COLOR_GROUPS["brown"][0], COLOR_GROUPS["pink"][0]])
+        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        self.assertLess(env.players[seat].cash, agent._reserve(env))
+        legal = set(env.get_allowed_actions(seat))
+        action = agent._raise_cash_action(env, legal)
+        self.assertIsNotNone(action)
+        self.assertTrue(OFFSETS["mortgage"] <= action < OFFSETS["unmortgage"])
+
+    def test_does_nothing_when_cash_is_healthy(self):
+        env, seat = self._threatened()
+        self._give(env, seat, [COLOR_GROUPS["brown"][0]])
+        env.players[seat].cash = 5000
+        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        legal = set(env.get_allowed_actions(seat))
+        self.assertIsNone(agent._raise_cash_action(env, legal))
+
+    def test_never_mortgages_a_deed_inside_a_monopoly(self):
+        env, seat = self._threatened()
+        self._give(env, seat, list(COLOR_GROUPS["brown"]))
+        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        legal = set(env.get_allowed_actions(seat))
+        action = agent._raise_cash_action(env, legal)
+        # Brown is our only holding and it is a complete group, so nothing may go.
+        self.assertIsNone(action)
+
+    def test_gives_up_the_lowest_earning_deed_first(self):
+        env, seat = self._threatened()
+        cheap = COLOR_GROUPS["brown"][0]
+        earner = 5  # Reading Railroad, opponents land on it far more often
+        self._give(env, seat, [cheap, earner])
+        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        legal = set(env.get_allowed_actions(seat))
+        earned = income_by_square(env, seat, 1)
+        self.assertGreater(earned.get(earner, 0.0), earned.get(cheap, 0.0))
+        action = agent._raise_cash_action(env, legal)
+        self.assertEqual(action, OFFSETS["mortgage"] + PROPERTY_IDS.index(cheap))
+
+    def test_recovery_and_investment_never_oscillate(self):
+        """Mortgage then unmortgage then mortgage would loop forever."""
+
+        env, seat = self._threatened()
+        self._give(
+            env, seat, [COLOR_GROUPS["brown"][0], COLOR_GROUPS["pink"][0], 5, 15]
+        )
+        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        seen = []
+        for _step in range(40):
+            legal = set(env.get_allowed_actions(seat))
+            action = agent.choose_action(env)
+            self.assertIn(action, legal)
+            if action == int(ActionType.END_TURN):
+                break
+            seen.append(action)
+            env.step(action)
+        mortgaged = [a for a in seen if OFFSETS["mortgage"] <= a < OFFSETS["unmortgage"]]
+        unmortgaged = [
+            a for a in seen if OFFSETS["unmortgage"] <= a < OFFSETS["improve_house"]
+        ]
+        self.assertEqual(
+            len(mortgaged), len(set(mortgaged)), "a deed was mortgaged twice"
+        )
+        self.assertEqual(unmortgaged, [], "undid its own recovery in the same turn")
+
+    def test_the_flag_disables_it(self):
+        """Off by default: 24 paired games showed no survival effect either way."""
+
+        env, seat = self._threatened()
+        self._give(env, seat, [COLOR_GROUPS["brown"][0], COLOR_GROUPS["pink"][0]])
+        self.assertFalse(DEFAULT_CONFIG.active_liquidation)
+        agent = SlayerV1(seat, DEFAULT_CONFIG)
+        legal = set(env.get_allowed_actions(seat))
+        self.assertIsNone(agent._raise_cash_action(env, legal))
 
 
 class TradeTest(unittest.TestCase):

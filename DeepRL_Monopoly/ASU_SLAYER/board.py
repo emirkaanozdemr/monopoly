@@ -186,6 +186,28 @@ def rent_quantile(env, player_id: int, quantile: float, turns: int = 1) -> float
     return outcomes[-1][0]
 
 
+def income_by_square(env, player_id: int, turns: int = 1) -> dict[int, float]:
+    """Expected rent each owned square collects, in one pass over opponents.
+
+    Used to choose which deed to give up when cash must be raised: the cheapest
+    deed to mortgage is the one earning the least, not the one with the lowest
+    price.
+    """
+
+    earned: dict[int, float] = {}
+    for opponent in env.players:
+        if opponent.player_id == player_id or opponent.bankrupt:
+            continue
+        for (square, dice_total), probability in landings(opponent, turns):
+            prop = env.properties.get(square)
+            if prop is None or prop.owner != player_id:
+                continue
+            earned[square] = earned.get(square, 0.0) + probability * rent_at(
+                env, square, dice_total
+            )
+    return earned
+
+
 def income(env, player_id: int, turns: int = 1) -> float:
     """Expected rent this player collects from live opponents."""
 
@@ -204,6 +226,7 @@ __all__ = [
     "exposure",
     "group_of",
     "income",
+    "income_by_square",
     "is_real_estate",
     "landings",
     "owned_in_group",

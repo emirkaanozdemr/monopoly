@@ -2,7 +2,8 @@
 
 The policy scores every decision in the units the engine ranks players by, then
 spends cash wherever a dollar buys the most net worth, subject to a solvency
-reserve set by a high quantile of the rent it may owe on the next turn.
+reserve sized by how much rent risk it can carry and still expect to survive
+the rest of the game.
 """
 
 from __future__ import annotations
@@ -29,9 +30,16 @@ from monopoly_game_engine.env import (
     PHASE_PRE_ROLL,
 )
 
-from .board import exposure, rent_quantile
+from .board import (
+    exposure,
+    group_of,
+    income_by_square,
+    owned_in_group,
+    rent_quantile,
+)
 from .scoring import (
     acquisition_gain,
+    development_outlook,
     disposal_loss,
     improvement_gain,
     liquidation_options,
@@ -41,6 +49,7 @@ from .scoring import (
 
 SLAYER_V1 = "slayer-v1"
 _EXCHANGE_STRIDE = len(PROPERTY_IDS) * (len(PROPERTY_IDS) - 1)
+_MAX_QUANTILE = 0.999
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,13 +66,29 @@ class SlayerConfig:
     """
 
     reserve_floor: float = 50.0
-    risk_quantile: float = 0.90
+    target_survival: float = 0.70
+    expected_game_length: float = 45.0
+    min_horizon: float = 4.0
     threat_multiple: float = 1.0
+    active_liquidation: bool = False
+    build_reserve_fraction: float = 0.25
     auction_value_fraction: float = 0.62
-    auction_denial_fraction: float = 0.22
+    denial_fraction: float = 0.22
     auction_step_fraction: float = 0.18
     jail_exposure_threshold: float = 95.0
     trade_margin: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.target_survival < 1.0:
+            raise ValueError("target_survival must be strictly between 0 and 1")
+        if self.min_horizon < 1.0:
+            raise ValueError("min_horizon must be at least one turn")
+        if self.expected_game_length <= 0.0:
+            raise ValueError("expected_game_length must be positive")
+        if self.threat_multiple < 0.0:
+            raise ValueError("threat_multiple must not be negative")
+        if not 0.0 <= self.build_reserve_fraction <= 1.0:
+            raise ValueError("build_reserve_fraction must be within [0, 1]")
 
     def evolve(self, **changes) -> "SlayerConfig":
         return replace(self, **changes)
@@ -85,58 +110,126 @@ class SlayerV1:
 
     # ── Solvency ──────────────────────────────────────────────────────────
 
-    def _reserve(self, env) -> float:
-        """Cash to keep back: the rent this player survives 90% of the time.
+    def _survival_quantile(self, env) -> float:
+        """Per-turn rent quantile implied by surviving the rest of the game.
 
-        On an empty board almost every landing owes nothing, so the reserve is
-        the floor and the agent invests freely. It rises on its own as
-        opponents develop, without any term that depends on what we own.
+        A fixed per-turn quantile is the wrong shape for this decision, because
+        the risk compounds over every turn still to be played. Insuring against
+        the 90th percentile each turn sounds safe and is not: measured games run
+        about 45 turns, and ``0.90 ** 45`` is under one percent. Choosing the
+        survival target first and solving for the per-turn quantile inverts that
+        relationship, and it also relaxes correctly near the end of a game,
+        where fewer remaining turns mean fewer chances to be ruined.
         """
 
         config = self.config
-        threat = rent_quantile(env, self.player_id, config.risk_quantile, 1)
+        horizon = max(config.min_horizon, config.expected_game_length - env.round)
+        quantile = config.target_survival ** (1.0 / horizon)
+        # rent_quantile requires a value strictly inside (0, 1); a very long
+        # horizon would otherwise round to 1.0.
+        return min(quantile, _MAX_QUANTILE)
+
+    def _reserve(self, env) -> float:
+        """Cash to keep back against the rent that could arrive next turn.
+
+        On an empty board almost every landing owes nothing, so the reserve is
+        the floor at any quantile and the agent still invests freely. It rises
+        on its own as opponents develop, and carries no term that depends on
+        what we own: crediting our own mortgage capacity here once created a
+        trap where owning nothing tightened the gate further.
+        """
+
+        config = self.config
+        threat = rent_quantile(env, self.player_id, self._survival_quantile(env), 1)
         return config.reserve_floor + config.threat_multiple * threat
 
     def _affordable(self, env, cost: float, reserve: float) -> bool:
         cash = float(env.players[self.player_id].cash)
         return cost <= cash and (cash - cost) >= reserve
 
+    # ── Valuing an acquisition ────────────────────────────────────────────
+
+    def _acquire_value(self, env, square: int) -> float:
+        """What acquiring ``square`` is worth to us, as a decision quantity.
+
+        Two corrections to the raw net-worth delta. Deeds in a colour group an
+        opponent has already entered are discounted, because we can never build
+        there and unbuilt rent is negligible. Against that, keeping a deed away
+        from the opponent who wants it most is worth paying for, whether it is
+        currently unowned or already theirs.
+        """
+
+        own = acquisition_gain(
+            env, self.player_id, square, include_denial=False
+        ) * development_outlook(env, self.player_id, square)
+        rivals = [
+            other.player_id
+            for other in env.players
+            if other.player_id != self.player_id and not other.bankrupt
+        ]
+        denial = 0.0
+        if rivals:
+            denial = max(
+                acquisition_gain(env, rival, square, include_denial=False)
+                for rival in rivals
+            )
+        return own + self.config.denial_fraction * denial
+
     # ── Investment candidates ─────────────────────────────────────────────
 
     def _investments(self, env, legal: set[int]) -> list[tuple[float, int]]:
-        """``(net worth gained per action, action)`` for every way to spend cash."""
+        """``(net worth gained per action, action)`` for every way to spend cash.
 
-        candidates: list[tuple[float, int]] = []
+        Each candidate carries the share of the reserve it must respect. Houses
+        are held to a fraction of it, because a house is not consumption: it is
+        the only purchase that both raises our income and raises what opponents
+        owe us, and measured games are decided by who is the creditor when
+        somebody goes bankrupt. Instrumentation found the full reserve refusing
+        56% of the builds the policy could legally afford, in games it then
+        lost with no houses on the board at all.
+        """
+
+        share = self.config.build_reserve_fraction
+        # Unmortgaging is the exact inverse of the recovery rule, so the two
+        # must never both be relaxed: mortgage, unmortgage, mortgage is an
+        # infinite loop. Holding unmortgage to the full reserve keeps the
+        # guarantee that no investment can drop cash back under it.
+        unmortgage_share = 1.0 if self.config.active_liquidation else share
+        candidates: list[tuple[float, float, int, float]] = []
         for index, square in enumerate(PROPERTY_IDS):
             action = OFFSETS["unmortgage"] + index
             if action not in legal:
                 continue
             prop = env.properties[square]
             cost = int(prop.mortgage_v * 1.1)
-            # Unmortgaging restores exactly what mortgaging destroyed.
+            # Unmortgaging restores exactly what mortgaging destroyed, and it
+            # brings an earning deed back, so it is treated as development.
             gain = mortgage_loss(env, square) - cost
-            candidates.append((gain, cost, action))
+            candidates.append((gain, cost, action, unmortgage_share))
 
         for index, square in enumerate(REAL_ESTATE_IDS):
             cost = float(PROPERTIES[square]["house_price"])
             action = OFFSETS["improve_hotel"] + index
             if action in legal:
                 candidates.append(
-                    (improvement_gain(env, square, True) - cost, cost, action)
+                    (improvement_gain(env, square, True) - cost, cost, action, share)
                 )
             action = OFFSETS["improve_house"] + index
             if action in legal:
                 candidates.append(
-                    (improvement_gain(env, square, False) - cost, cost, action)
+                    (improvement_gain(env, square, False) - cost, cost, action, share)
                 )
 
-        candidates.extend(self._trade_proposals(env, legal))
+        candidates.extend(
+            (gain, cost, action, 1.0)
+            for gain, cost, action in self._trade_proposals(env, legal)
+        )
         reserve = self._reserve(env)
         return sorted(
             (
                 (gain, action)
-                for gain, cost, action in candidates
-                if gain > 0 and self._affordable(env, cost, reserve)
+                for gain, cost, action, scale in candidates
+                if gain > 0 and self._affordable(env, cost, reserve * scale)
             ),
             key=lambda item: (-item[0], item[1]),
         )
@@ -165,9 +258,9 @@ class SlayerV1:
             offered = PROPERTY_IDS[offer_index]
             requested = PROPERTY_IDS[request_index]
 
-            gain = acquisition_gain(
-                env, self.player_id, requested, include_denial=False
-            ) - disposal_loss(env, self.player_id, offered)
+            gain = self._acquire_value(env, requested) - disposal_loss(
+                env, self.player_id, offered
+            )
             counter = acquisition_gain(
                 env, target, offered, include_denial=False
             ) - disposal_loss(env, target, requested)
@@ -175,6 +268,43 @@ class SlayerV1:
                 continue
             proposals.append((gain * self.config.trade_margin, 0.0, action))
         return proposals
+
+    def _raise_cash_action(self, env, legal: set[int]) -> int | None:
+        """Mortgage back up to the reserve before a rent bill arrives.
+
+        The reserve was only ever a gate on spending, and that is not enough:
+        instrumented games spent about half of their own decisions below it,
+        because the reserve climbs as opponents develop while our cash is
+        already committed. Refusing to spend cannot recover from that; only
+        raising cash can.
+
+        Two restrictions keep this from becoming its own death spiral. Deeds in
+        a complete color group are never mortgaged, because mortgaging sets
+        their rent to zero and that rent is the income the policy wins with,
+        and houses are never sold, which costs 3 to 11 net worth per dollar
+        against 2.5 for an ordinary mortgage. Within what is left, the deed
+        earning the least is given up first.
+        """
+
+        if not self.config.active_liquidation:
+            return None
+        cash = float(env.players[self.player_id].cash)
+        reserve = self._reserve(env)
+        if cash >= reserve:
+            return None
+
+        earned = income_by_square(env, self.player_id, 1)
+        best: tuple[float, float, int] | None = None
+        for index, square in enumerate(PROPERTY_IDS):
+            action = OFFSETS["mortgage"] + index
+            if action not in legal:
+                continue
+            if owned_in_group(env, self.player_id, square) == len(group_of(square)):
+                continue  # never break an earning monopoly
+            key = (earned.get(square, 0.0), float(env.properties[square].mortgage_v), action)
+            if best is None or key < best:
+                best = key
+        return None if best is None else best[2]
 
     # ── Phase handlers ────────────────────────────────────────────────────
 
@@ -215,7 +345,7 @@ class SlayerV1:
         theirs = float(offer.cash_requested) - float(offer.cash_offered)
         if offer.offered_prop is not None:
             square = offer.offered_prop.square_id
-            mine += acquisition_gain(env, self.player_id, square, include_denial=False)
+            mine += self._acquire_value(env, square)
             theirs -= disposal_loss(env, proposer, square)
         if offer.requested_prop is not None:
             square = offer.requested_prop.square_id
@@ -236,18 +366,7 @@ class SlayerV1:
         square = env.auction_property_id
         if square is None:
             return int(AuctionAction.PASS)
-        ceiling = config.auction_value_fraction * acquisition_gain(
-            env, self.player_id, square
-        )
-        rivals = [
-            other.player_id
-            for other in env.players
-            if other.player_id != self.player_id and not other.bankrupt
-        ]
-        if rivals:
-            ceiling += config.auction_denial_fraction * max(
-                acquisition_gain(env, rival, square) for rival in rivals
-            )
+        ceiling = config.auction_value_fraction * self._acquire_value(env, square)
 
         reserve = self._reserve(env)
         increments = [
@@ -303,7 +422,7 @@ class SlayerV1:
             if int(ActionType.BUY_PROPERTY) in legal:
                 square = env.players[self.player_id].position
                 price = float(PROPERTIES[square]["price"])
-                gain = acquisition_gain(env, self.player_id, square) - price
+                gain = self._acquire_value(env, square) - price
                 if gain > 0 and self._affordable(env, price, self._reserve(env)):
                     return int(ActionType.BUY_PROPERTY)
             return int(ActionType.END_TURN)
@@ -316,6 +435,13 @@ class SlayerV1:
                 jail = self._jail_action(env, legal)
                 if jail is not None:
                     return jail
+                # Strictly before investing, and never alongside it. Every
+                # investment leaves cash at or above the reserve, so raising
+                # cash cannot be re-triggered by our own spending and the two
+                # rules cannot oscillate against each other.
+                recovery = self._raise_cash_action(env, legal)
+                if recovery is not None:
+                    return recovery
             investments = self._investments(env, legal)
             if investments:
                 return investments[0][1]

@@ -18,6 +18,9 @@ from .board import exposure, group_of, income, is_real_estate, owned_in_group
 
 SOLO_MULTIPLIER = 2.5
 MONOPOLY_MULTIPLIER = 5.0
+# A colour group an opponent has entered can never be built on by us
+# through purchase, so its deeds are kept only for blocking and trade.
+BLOCKED_GROUP_WEIGHT = 0.25
 _PROPERTY_INDEX = {square: index for index, square in enumerate(PROPERTY_IDS)}
 _REAL_ESTATE_INDEX = {square: index for index, square in enumerate(REAL_ESTATE_IDS)}
 
@@ -101,6 +104,33 @@ def _group_worth_without(
             continue
         total += deed_worth(item, prop.houses, prop.mortgaged, monopoly)
     return total
+
+
+def development_outlook(env, player_id: int, square: int) -> float:
+    """How much of a deed's worth is still strategically live for this player.
+
+    Houses need the complete colour group — the engine refuses to build
+    otherwise — and rent without houses is trivial: New York Avenue pays $16
+    alone, $32 as a monopoly, and $1,000 with a hotel. So a deed in a group an
+    opponent already holds part of can never become a weapon for us, however
+    much net worth it books.
+
+    ``net_worth`` prices both kinds of deed identically at 2.5x list, and
+    following it spread the policy across 4.5 colour groups while ASU
+    concentrated on 3.2, which is the measured difference between them.
+    Railroads and utilities are exempt: their rent scales with how many you
+    hold, so partial ownership still earns.
+    """
+
+    if not is_real_estate(square):
+        return 1.0
+    blocked = any(
+        item != square
+        and env.properties[item].owner is not None
+        and env.properties[item].owner != player_id
+        for item in group_of(square)
+    )
+    return BLOCKED_GROUP_WEIGHT if blocked else 1.0
 
 
 def disposal_loss(env, player_id: int, square: int) -> float:
@@ -239,6 +269,7 @@ def equity(env, player_id: int, rent_horizon: float, survival_bonus: float) -> f
 __all__ = [
     "acquisition_gain",
     "deed_worth",
+    "development_outlook",
     "equity",
     "group_worth",
     "improvement_gain",
