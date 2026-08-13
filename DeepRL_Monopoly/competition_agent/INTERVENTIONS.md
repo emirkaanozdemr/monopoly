@@ -64,13 +64,14 @@ The earlier chat table printed "40.77% … 466/2000", inviting the reading
 466 completed games = 40.77%** — the CI [36.40, 45.29] matches n=466, as
 noted. Honest current figure (run still in progress, completed games only):
 
-> **teacher vs strong field: 223/571 = 39.05%, Wilson [35.14, 43.12]**
-> (decisive 38.0%; 62% of teacher games step-capped — the teacher baseline
-> sits in the same truncated regime as everything else)
+> **FINAL (n=2000): teacher vs strong field: 790/2000 = 39.50%,
+> Wilson [37.38, 41.66]** (cap-3000 regime, same seeds/seats as Candidate D)
 
-The n=2000 figure will replace this when the run finishes. No finding is
-interpreted against the interim number. GAPS.md's Phase 0 table remains
-"PENDING" until then.
+Paired against Candidate D on the same 2000 seeds: **+1.10pp**
+[−0.90, +3.10], McNemar p = 0.30 — not significant. Candidate D is
+statistically at teacher level on the strong field. Note the adopted arm D
+(+2.95pp at natural game end) exceeds this teacher gap, though the two
+numbers live in different cap regimes and are not directly comparable.
 
 ## Blocker 0c — paired testing (RESOLVED)
 
