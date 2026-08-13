@@ -222,14 +222,76 @@ def _as_action_index(value: Any) -> int:
     return int(value.__index__())
 
 
+def _env_fingerprint(env) -> tuple:
+    """A cheap summary of every piece of game state a submission could
+    profitably mutate.  ``env`` is handed to entrants raw (it cannot be
+    reconstructed from the state vector), so the harness must be able to
+    detect a submission that edits cash, ownership, buildings, debt, or the
+    trade queue instead of playing (SLAYER_REVIEW.md 6)."""
+
+    players = tuple(
+        (
+            int(p.cash),
+            bool(p.bankrupt),
+            int(p.position),
+            bool(p.in_jail),
+            int(p.jail_turns),
+            bool(p.gooj_card),
+        )
+        for p in env.players
+    )
+    deeds = tuple(
+        (
+            -1 if prop.owner is None else int(prop.owner),
+            int(prop.houses),
+            bool(prop.mortgaged),
+        )
+        for _, prop in sorted(env.properties.items())
+    )
+    trades = tuple(
+        (
+            int(sender),
+            int(offer.to_player),
+            None if offer.offered_prop is None else int(offer.offered_prop.square_id),
+            None if offer.requested_prop is None else int(offer.requested_prop.square_id),
+            int(offer.cash_offered),
+            int(offer.cash_requested),
+        )
+        for sender, offer in sorted(env.pending_trades.items())
+    )
+    return (
+        players,
+        deeds,
+        trades,
+        env.phase,
+        bool(env.has_rolled),
+        int(env.round),
+        env.debt_player,
+        env.debt_creditor,
+        int(env.debt_amount),
+        env.auction_property_id,
+        env.auction_high_bid,
+        env.auction_high_bidder,
+        int(env.houses_available),
+        int(env.hotels_available),
+        tuple(env.turn_order),
+        int(env.current_turn_idx),
+    )
+
+
+class EnvironmentMutationError(SubmissionError):
+    """The submission mutated the environment instead of just reading it."""
+
+
 class SubmissionAgent:
     """Adapt a submission entrypoint to the engine's ``choose_action(env)`` seat.
 
     The engine drives agents with the environment; the contract hands entrants a
     state vector and a legal-action list.  This class bridges the two, and
-    enforces the two properties the paired-seed evaluator depends on: the
-    submission may not perturb the global RNG streams, and it may not return an
-    action outside the legal set.
+    enforces the three properties the paired-seed evaluator depends on: the
+    submission may not perturb the global RNG streams, may not return an
+    action outside the legal set, and — because ``env`` is injected raw for
+    policies that need the board — may not mutate the environment.
     """
 
     def __init__(
@@ -257,6 +319,7 @@ class SubmissionAgent:
         import random as _random
 
         before = _random.getstate()
+        env_before = _env_fingerprint(env) if "env" in self.injections else None
         with preserve_global_rng():
             try:
                 raw = self.target(state, allowed, **kwargs)
@@ -266,6 +329,12 @@ class SubmissionAgent:
                 ) from exc
             if _random.getstate() != before:
                 self.rng_perturbations += 1
+        if env_before is not None and _env_fingerprint(env) != env_before:
+            raise EnvironmentMutationError(
+                f"submission for seat {self.player_id} mutated the environment "
+                "(cash, ownership, buildings, trades, or phase state changed "
+                "during its decision)"
+            )
 
         action = _as_action_index(raw)
         if action not in allowed:
