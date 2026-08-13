@@ -54,6 +54,10 @@ TRADE_W = {
 }
 TRADE_GATE = float(os.environ.get("TRADE_GATE", "3.92"))
 
+# gap/arm-d — intervention switch (INTERVENTIONS.md). Inert unless
+# GAP_ARM=D is set in the environment before import.
+GAP_ARM = os.environ.get("GAP_ARM", "")
+
 # Optional override, for A/B-ing a re-fitted scorer against the shipped one
 # without editing the frozen agent. Points at a JSON file holding
 # {"weights": {feature: weight, ...}, "gate": <float>}; any feature named in
@@ -217,6 +221,7 @@ class SpecPolicy:
 
     def __init__(self, player_id: int, rng_seed: int = 0):
         self.player_id = player_id
+        self.gap_fires = 0    # gap/arm-d: times the override fired
 
     # ------------------------------------------------------------------
     def choose_action(self, env) -> int:
@@ -357,6 +362,25 @@ class SpecPolicy:
         prop = env.properties.get(sq)
         if prop is None or prop.owner is not None:
             return None
+
+        # gap/arm-d — unconditional buy on group-completing/blocking deeds.
+        # Fixed intervention (INTERVENTIONS.md): when the landed-on unowned
+        # deed completes a real-estate group we hold the rest of, or is the
+        # last missing piece of a group a single opponent holds the rest of,
+        # buy whenever cash allows (BUY being legal implies affordability),
+        # overriding the A3 gate. Railroads/utilities excluded. The override
+        # count is reported via gap_fires.
+        if GAP_ARM == "D":
+            color = PROPERTIES[sq]["color"]
+            if color not in ("railroad", "utility"):
+                sibs = [x for x in COLOR_GROUPS[color] if x != sq]
+                completes = all(env.properties[x].owner == pid for x in sibs)
+                blocks = any(
+                    all(env.properties[x].owner == o for x in sibs)
+                    for o in range(len(env.players)) if o != pid)
+                if completes or blocks:
+                    self.gap_fires += 1
+                    return BUY
 
         # A3 — buy iff (cash - price) + E[next-round net rent] >= 200, with the
         # rent term from A4/A5's complete-turn enumeration over real positions.
