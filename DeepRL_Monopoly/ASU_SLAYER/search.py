@@ -157,7 +157,21 @@ class SlayerRolloutV1:
                 return candidates[0]
 
             self.searched_decisions += 1
-            seeds = [self.search.seed + index for index in range(self.search.rollouts)]
+            # Salt the rollout seeds by the decision context: identical seeds
+            # for every candidate at THIS decision (common random numbers),
+            # but different dice from one decision to the next. A fixed
+            # 0..rollouts-1 seed set replayed the same six dice sequences for
+            # the whole game and correlated every decision's error
+            # (SLAYER_REVIEW.md 4.4).
+            salt = (
+                31 * int(env.round)
+                + 7 * int(env.players[self.player_id].position)
+                + self.searched_decisions
+            ) * 1009
+            seeds = [
+                self.search.seed + salt + index
+                for index in range(self.search.rollouts)
+            ]
             best_action = candidates[0]
             best_score = None
             for candidate in candidates:
