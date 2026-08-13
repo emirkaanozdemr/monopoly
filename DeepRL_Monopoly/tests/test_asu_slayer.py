@@ -615,6 +615,45 @@ class TradeTest(unittest.TestCase):
         self.assertEqual(decision, int(ActionType.DECLINE_TRADE))
 
 
+class SearchContestTest(unittest.TestCase):
+    """``contest_margin`` was defined but never consulted; see search.py."""
+
+    def _agent(self, seat: int = 0, margin: float = 0.02) -> SlayerRolloutV1:
+        return SlayerRolloutV1(seat, DEFAULT_CONFIG, SearchConfig(contest_margin=margin))
+
+    def test_a_dominant_top_investment_is_not_contested(self):
+        agent = self._agent()
+        self.assertFalse(agent._contested([(100.0, 1), (10.0, 2)]))
+
+    def test_a_close_top_investment_is_contested(self):
+        agent = self._agent()
+        self.assertTrue(agent._contested([(100.0, 1), (99.0, 2)]))
+
+    def test_a_single_investment_is_not_contested(self):
+        agent = self._agent()
+        self.assertFalse(agent._contested([(100.0, 1)]))
+
+    def test_uncontested_shortlist_skips_the_rollout(self):
+        env = fresh_env()
+        seat = env.active_player_id()
+        for square in COLOR_GROUPS["brown"]:
+            prop = env.properties[square]
+            prop.owner = seat
+            env.players[seat].properties.append(prop)
+        env._update_monopolies()
+        # Even-building leaves only the bare square buildable, so exactly one
+        # investment action is legal.
+        env.properties[COLOR_GROUPS["brown"][0]].houses = 1
+        env.players[seat].cash = 500
+
+        agent = self._agent(seat)
+        legal = set(env.get_allowed_actions(seat))
+        investments = agent.base._investments(env, legal)
+        self.assertEqual(len(investments), 1, "expected exactly one legal build")
+        candidates = agent._candidates(env, legal)
+        self.assertEqual(candidates, [investments[0][1]])
+
+
 class RegistrationTest(unittest.TestCase):
     def test_evaluator_accepts_the_slayer_identifiers(self):
         for name, expected in (

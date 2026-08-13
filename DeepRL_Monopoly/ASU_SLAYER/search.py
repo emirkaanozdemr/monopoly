@@ -122,10 +122,30 @@ class SlayerRolloutV1:
             if int(ActionType.ACCEPT_TRADE) in legal:
                 add(int(ActionType.ACCEPT_TRADE))
                 add(int(ActionType.DECLINE_TRADE))
-            for _gain, action in self.base._investments(env, legal):
+            investments = self.base._investments(env, legal)
+            if investments and not self._contested(investments):
+                return candidates[: self.search.shortlist]
+            for _gain, action in investments:
                 add(action)
             add(int(ActionType.END_TURN))
         return candidates[: self.search.shortlist]
+
+    def _contested(self, investments: list[tuple[float, int]]) -> bool:
+        """Whether the top investment is close enough to the runner-up to need search.
+
+        ``search.contest_margin`` was defined but never read, so every turn with
+        a legal END_TURN alongside an investment built a two-item shortlist and
+        paid for a full rollout, even when one action dominated by a wide
+        margin. Comparing the top two gains restores the module's documented
+        behaviour: only a genuinely close call earns a rollout.
+        """
+
+        if len(investments) < 2:
+            return False
+        best, runner_up = investments[0][0], investments[1][0]
+        if best <= 0:
+            return False
+        return (best - runner_up) <= self.search.contest_margin * best
 
     # ── Rollout ───────────────────────────────────────────────────────────
 
