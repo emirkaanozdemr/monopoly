@@ -11,14 +11,15 @@ All results are associations measured in traces; none is a causal claim.
 
 | policy | wins / games | rate | 95% Wilson CI |
 |---|---|---|---|
-| ASU_FROZEN_TEACHER (value variant) | PENDING | PENDING | PENDING |
+| ASU_FROZEN_TEACHER (value variant) | 790 / 2000 | 39.50% | [37.38, 41.66] |
 | Candidate D (`final`, ranker on) | 768 / 2000 | 38.40% | [36.29, 40.55] |
 | Candidate D base arm (ranker off) | 759 / 2000 | 37.95% | [35.85, 40.10] |
 | seat parity | — | 25.00% | — |
 
-(Teacher run in progress, n=2000, same `field_ref.py` seat convention;
-interim at n=200: 37.50% [31.09, 44.39]. This section is updated when the
-run completes; no finding below is interpreted against the interim number.)
+Paired on the same 2000 seeds: teacher − Candidate D = **+1.10pp**,
+bootstrap 95% CI [−0.90, +3.10], McNemar exact p = 0.30 — not significant.
+Candidate D is statistically at teacher level on this field; the headroom
+the gaps could recover against the teacher is ~1pp and unproven.
 
 Context from the runs' own proposal accounting: the strong field accepts
 0.020% of Candidate D's proposals and 0.035% of the teacher's — near-zero
@@ -114,9 +115,8 @@ Reported as unconfirmed; not carried as a result.
 4. H3 — direction consistent, effect ≤ ~7pp, unconfirmed.
 
 ## Unresolved
-- Phase 0 teacher number pending (section above updates on completion);
-  whether ~38% is at, above, or below teacher level on this field decides
-  whether these gaps represent recoverable headroom.
+- ~~Phase 0 teacher number pending~~ Resolved: teacher 39.50% [37.38,
+  41.66], paired +1.10pp over Candidate D, p=0.30 — at-teacher-level.
 - H4's causal direction cannot be settled from traces: it needs an
   intervention (e.g. a gate-threshold A/B on fresh seeds), which is agent
   modification and out of scope for this task.

@@ -2714,3 +2714,46 @@ exploits the relaxation more than the field per-build (8.12% vs 5.67%) and
 ~10x per-capita in absolute count. No implementation, no A/B run, no seeds
 spent. The intervention would have imitated behavior the agent already
 exceeds.
+
+## DG.2 — Measurement regime for the intervention arms
+
+Blocker 0a found the 3000-step harness cap adjudicates 62% of games at
+median round 80, while the repo's own evaluator (DEFAULT_MAX_DECISIONS =
+20,000) always reaches the engine's round-200 terminal rule. Paired
+validation on fresh seeds (964000+, n=300): 2.7% outcome flips, delta
++0.67pp [-1.00, +2.67]. **Decision: all arm A/Bs run at cap 20000** (games
+end naturally). Baseline re-measured there: 38.85% [36.74, 41.01], n=2000,
+seeds 962000-963999.
+
+## DG.3 — Arm A REJECTED: cash-for-deed proposals change nothing
+
+The channel (buy_trade, 0 chosen / 34.8M legal in diagnosis) was opened:
+528,545 firings across 2000 games. The strong field declines cash offers
+at the same ~100% rate as exchanges (224 accepts of 575k proposals). Paired
+delta +0.10pp [+0.00, +0.25], p=0.5; 2/2000 games changed outcome; no
+mechanism counter moved. Trade-based acquisition is dead at the
+counterparty, not the proposer. REJECT.
+
+## DG.4 — Arm B MECHANISM-ONLY: killing the churn loop wins nothing
+
+Rejecting net-list-value <= 0 offers eliminated the churn loop (accepted
+trades 33,655 -> 884, -97%) with no measurable win-rate effect: -1.00pp
+[-2.70, +0.70], p=0.28. The H3 association was not causal at any
+detectable size. Logged as MECHANISM-ONLY; not retuned.
+
+## DG.5 — Arm C REJECTED as harmful: the "positive" offers were traps
+
+Accepting net-list-value >= +50 offers fired only 335 times and cost
+-3.35pp [-4.20, -2.55], p=1.4e-17; bankruptcy 28.7% -> 35.2%. The ~17k
+rejected positive offers flagged in diagnosis were CORRECT rejections: the
+field offers list-value surplus exactly when the trade serves its own
+structure. Closes BUGS.md's unresolved item causally. REJECT.
+
+## DG.6 — Arm D ADOPTED: unconditional buy on completing/blocking deeds
+
+Overriding the A3 cash gate for group-completing or group-blocking deeds:
++2.95pp [+1.90, +4.00], McNemar p=1.7e-08 (survives Bonferroni /4), with
+the mechanism moving coherently (full-group rate 34.7% -> 38.1%,
+bankruptcy -2.5pp) at 0.63 firings/game. First significant positive
+intervention on the strong field. ADOPT: flip GAP_ARM=D on by default in
+final_agent when merging.

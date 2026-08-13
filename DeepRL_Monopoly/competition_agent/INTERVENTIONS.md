@@ -1,10 +1,10 @@
 # INTERVENTIONS.md — causal testing of the BUGS.md / GAPS.md gaps
 
-Status: **STOPPED at Blocker 0a per task rule** — the competition-harness cap
-differs from the 3000 used by every prior measurement. Findings and the
-quantified impact are below; no arm has been run. Arms A–D are implemented
-nowhere yet; Arm E resolved at its precheck (negative). Awaiting a decision on
-the measurement regime before any A/B.
+Status: **COMPLETE.** Blocker 0 resolved (cap-20000 regime chosen after the
+STOP finding); all arms measured at n=2000 on seeds 962000–963999, paired
+McNemar + bootstrap, Bonferroni /4. Verdicts: A REJECT, B MECHANISM-ONLY,
+C REJECT (harmful, significant), **D ADOPT (+2.95pp, p=1.7e-08)**,
+E REJECT at precheck.
 
 ## Blocker 0a — step-cap semantics (RESOLVED, STOP condition met)
 
@@ -64,13 +64,14 @@ The earlier chat table printed "40.77% … 466/2000", inviting the reading
 466 completed games = 40.77%** — the CI [36.40, 45.29] matches n=466, as
 noted. Honest current figure (run still in progress, completed games only):
 
-> **teacher vs strong field: 223/571 = 39.05%, Wilson [35.14, 43.12]**
-> (decisive 38.0%; 62% of teacher games step-capped — the teacher baseline
-> sits in the same truncated regime as everything else)
+> **FINAL (n=2000): teacher vs strong field: 790/2000 = 39.50%,
+> Wilson [37.38, 41.66]** (cap-3000 regime, same seeds/seats as Candidate D)
 
-The n=2000 figure will replace this when the run finishes. No finding is
-interpreted against the interim number. GAPS.md's Phase 0 table remains
-"PENDING" until then.
+Paired against Candidate D on the same 2000 seeds: **+1.10pp**
+[−0.90, +3.10], McNemar p = 0.30 — not significant. Candidate D is
+statistically at teacher level on the strong field. Note the adopted arm D
+(+2.95pp at natural game end) exceeds this teacher gap, though the two
+numbers live in different cap regimes and are not directly comparable.
 
 ## Blocker 0c — paired testing (RESOLVED)
 
@@ -94,7 +95,91 @@ false — the agent already exploits it more, absolutely and per-build. No
 implementation, no A/B. Verdict: **REJECT (precheck)** — to be appended to
 DECISIONS.md with these numbers.
 
-## Arms A–D — NOT RUN (gated on the Blocker 0a decision)
+## Regime decision
+Cap 20000 chosen (games end naturally by the engine's round-200 rule).
+Baseline arm: Candidate D unchanged, seeds 962000–963999, seat = seed % 4,
+strong field, n=2000: **777/2000 = 38.85% [36.74, 41.01]**; mechanism
+counters: full_group 34.7%, net-completing trades 1, accepted trades
+(agent party) 33,655. All paired tests below: McNemar exact + 10k paired
+bootstrap, Bonferroni /4 → α = 0.0125.
+
+## Arm A — cash-for-deed channel — **REJECT**
+Implementation: `_propose_trade` first offers cash for a deed completing a
+group the agent holds the rest of, capped at 50% of cash (fixed pre-run),
+highest multiplier preferred. Exchange scoring untouched. GAP_ARM=A.
+
+| | baseline | arm A |
+|---|---|---|
+| win rate | 38.85% [36.74, 41.01] | 38.95% [36.84, 41.11] |
+| paired Δ | — | **+0.10pp** [+0.00, +0.25], McNemar p = 0.5 |
+| gap_fires | 0 | 528,545 |
+| proposals → accepted | 207,098 → 301 | 575,544 → 224 |
+| full_group / net_complete | 34.7% / 1 | 34.7% / 0 |
+
+The channel opened and fired 264×/game; the strong field declines cash
+offers exactly as it declines exchanges (~0.04%). Only 2/2000 games changed
+outcome. No mechanism counter moved. The gap (buy_trade 0/34.8M) is real
+but closing it buys nothing against this field: acquisition-by-trade is
+dead at the counterparty, not at the proposer. REJECT.
+
+## Arm B — reject net≤0 offers — **MECHANISM-ONLY**
+Implementation: `_trade_reply` declines any offer with net list-value ≤ 0
+before the deed_value evaluation; positive handling untouched. GAP_ARM=B.
+
+| | baseline | arm B |
+|---|---|---|
+| win rate | 38.85% [36.74, 41.01] | 37.85% [35.75, 40.00] |
+| paired Δ | — | **−1.00pp** [−2.70, +0.70], McNemar p = 0.28 |
+| gap_fires | 0 | 368,269 |
+| accepted trades (agent party) | 33,655 | **884 (−97%)** |
+| full_group / net_complete | 34.7% / 1 | 32.0% / 3 |
+| discordant pairs | — | 310 |
+
+The churn loop (BUGS.md h; 38,120 cyclic re-trades) is eliminated, with **no
+measurable win-rate effect** — the point estimate is mildly negative. This is
+the causal test H3 could not deliver as an association: churn does not cause
+losses at any detectable size. Logged as MECHANISM-ONLY per protocol; not
+retuned.
+
+## Arm C — accept net≥+50 offers — **REJECT (harmful, significant)**
+Implementation: `_trade_reply` accepts any offer with net list-value ≥ +50
+after the solvency guards; threshold fixed pre-run. GAP_ARM=C.
+
+| | baseline | arm C |
+|---|---|---|
+| win rate | 38.85% [36.74, 41.01] | 35.50% [33.43, 37.62] |
+| paired Δ | — | **−3.35pp** [−4.20, −2.55], McNemar p = 1.4e-17 |
+| gap_fires | 0 | 335 |
+| discordant pairs | — | 3 wins gained, 70 lost |
+| bankrupt | 28.7% | 35.2% |
+
+335 firings cost 3.35pp — roughly one lost game per five acceptances. The
+~17k "rejected positive offers" flagged in BUGS.md were CORRECT rejections:
+the field offers list-value surplus precisely when the trade is
+strategically advantageous to itself. This also closes BUGS.md's Unresolved
+item on those rejections, causally. REJECT.
+
+## Arm D — unconditional buy on completing/blocking deeds — **ADOPT**
+Implementation: `_buy` overrides the A3 cash gate and buys any affordable
+unowned real-estate deed that completes an agent group or is the last
+missing piece of a single opponent's group. Not conditioned on decline rate
+(the H4 confounder). GAP_ARM=D.
+
+| | baseline | arm D |
+|---|---|---|
+| win rate | 38.85% [36.74, 41.01] | **41.80% [39.66, 43.98]** |
+| paired Δ | — | **+2.95pp** [+1.90, +4.00], McNemar p = 1.7e-08 |
+| gap_fires | 0 | 1,255 (0.63/game) |
+| full_group | 34.7% | **38.1%** |
+| net_complete / accepted | 1 / 33,655 | 3 / 31,058 |
+| bankrupt | 28.7% | 26.2% |
+
+Significant after Bonferroni (p « 0.0125), mechanism moves coherently with
+the win rate (group formation +3.4pp, bankruptcy −2.5pp), and the
+intervention is surgical (0.63 firings/game). 85 games flipped to wins
+against 26 to losses. ADOPT.
+
+## Arms A–D — protocol (as pre-registered)
 
 Ready to implement per spec once the regime is chosen:
 - **A** `gap/arm-a-cash-for-deed` — extend `_propose_trade` with buy_trade
