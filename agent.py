@@ -240,9 +240,6 @@ class _SnapshotEnv:
         return self._incoming.from_player, self._incoming
 
 
-_POLICIES: dict[int, "SlayerV1"] = {}
-
-
 def _fallback(allowed: list[int]) -> int:
     legal = set(allowed)
     for preferred in (
@@ -261,19 +258,36 @@ def _fallback(allowed: list[int]) -> int:
     return remaining[0] if remaining else allowed[0]
 
 
-def choose_action(state, player_id, allowed_actions):
-    allowed = [int(action) for action in allowed_actions]
-    if len(allowed) == 1:
-        return allowed[0]
+class Agent:
+    """One seat's policy, constructed once and reused for every decision."""
 
-    try:
-        policy = _POLICIES.get(player_id)
-        if policy is None:
-            policy = _POLICIES[player_id] = SlayerV1(player_id)
-        env = _SnapshotEnv(state["board"], state["vector"], player_id, allowed)
-        action = int(policy.choose_action(env))
-        if action in allowed:
-            return action
-    except Exception:
-        pass
-    return _fallback(allowed)
+    def __init__(self, player_id):
+        self.player_id = player_id
+        self.policy = SlayerV1(player_id)
+
+    def choose_action(self, state, allowed_actions):
+        allowed = [int(action) for action in allowed_actions]
+        if len(allowed) == 1:
+            return allowed[0]
+
+        try:
+            env = _SnapshotEnv(
+                state["board"], state["vector"], self.player_id, allowed
+            )
+            action = int(self.policy.choose_action(env))
+            if action in allowed:
+                return action
+        except Exception:
+            pass
+        return _fallback(allowed)
+
+
+_AGENTS = {}
+
+
+def choose_action(state, player_id, allowed_actions):
+    agent = _AGENTS.get(player_id)
+    if agent is None:
+        agent = Agent(player_id)
+        _AGENTS[player_id] = agent
+    return agent.choose_action(state, allowed_actions)
