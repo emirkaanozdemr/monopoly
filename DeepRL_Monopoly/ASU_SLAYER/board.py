@@ -136,12 +136,10 @@ def rent_at(env, square: int, dice_total: int = 7) -> int:
     return prop.data["rent"][0] * (2 if monopoly else 1)
 
 
-def exposure(env, player_id: int, turns: int = 1) -> tuple[float, float]:
-    """Expected and worst-case rent this player owes over ``turns`` turns."""
-
+def _exposure_over(env, player_id: int, walk) -> tuple[float, float]:
     expected = 0.0
     worst = 0.0
-    for (square, dice_total), probability in landings(env.players[player_id], turns):
+    for (square, dice_total), probability in walk:
         prop = env.properties.get(square)
         if prop is None or prop.owner is None or prop.owner == player_id:
             continue
@@ -150,6 +148,36 @@ def exposure(env, player_id: int, turns: int = 1) -> tuple[float, float]:
         if rent > worst:
             worst = rent
     return expected, worst
+
+
+def exposure(env, player_id: int, turns: int = 1) -> tuple[float, float]:
+    """Expected and worst-case rent this player owes over ``turns`` turns."""
+
+    return _exposure_over(env, player_id, landings(env.players[player_id], turns))
+
+
+def exposure_if_free(env, player_id: int, turns: int = 1) -> tuple[float, float]:
+    """The same, for a player who is out of jail and standing where they are.
+
+    ``exposure`` measures the state the player is actually in, and for someone
+    sitting in jail that state is mostly "does not move": only a double leaves
+    the cell, so five rolls in six land nowhere and owe nothing. That makes it
+    the wrong number for the one decision that asks what leaving would cost,
+    and it is wrong by a large factor -- on a board carrying three hotelled
+    monopolies the in-jail figure reads 52.8 where the free figure is 542.5.
+
+    The hard ceiling is what makes it a bug rather than a bias. From square 10
+    a jailed player can only reach 12, 14, 16, 18, 20 and 22, one roll in
+    thirty-six each, so the in-jail expectation cannot exceed 2820/36 = 78.33
+    however hostile the board becomes -- below any threshold set in units of
+    real rent.
+    """
+
+    return _exposure_over(
+        env, player_id, _landings(JAIL_SQUARE if env.players[player_id].in_jail
+                                  else int(env.players[player_id].position),
+                                  False, 0, int(turns))
+    )
 
 
 def rent_quantile(env, player_id: int, quantile: float, turns: int = 1) -> float:
@@ -208,6 +236,100 @@ def income_by_square(env, player_id: int, turns: int = 1) -> dict[int, float]:
     return earned
 
 
+def _rent_under(env, ownership: dict[int, int], houses: dict[int, int], item: int,
+                dice_total: int) -> int:
+    """``rent_at`` evaluated against a hypothetical owner/house map.
+
+    ``ownership`` and ``houses`` override the live board for the squares they
+    name; everything else is read from ``env``. Only the group containing the
+    square being valued ever needs overriding, because rent depends on the
+    board solely through that group.
+    """
+
+    prop = env.properties.get(item)
+    if prop is None:
+        return 0
+    owner = ownership.get(item, prop.owner)
+    if owner is None or prop.mortgaged:
+        return 0
+    group = group_of(item)
+    count = sum(
+        1 for square in group
+        if ownership.get(square, env.properties[square].owner) == owner
+    )
+    data = prop.data
+    if prop.color == "railroad":
+        return data["rent"][min(count - 1, 3)]
+    if prop.color == "utility":
+        return data["rent"][0 if count == 1 else 1] * dice_total
+    level = houses.get(item, prop.houses)
+    if level:
+        return data["rent"][min(level, 5)]
+    return data["rent"][0] * (2 if count == len(group) else 1)
+
+
+def _collected_delta(env, player_id: int, affected: frozenset[int],
+                     ownership: dict[int, int], houses: dict[int, int],
+                     turns: int) -> float:
+    total = 0.0
+    for opponent in env.players:
+        if opponent.player_id == player_id or opponent.bankrupt:
+            continue
+        for (square, dice_total), probability in landings(opponent, turns):
+            if square not in affected:
+                continue
+            now = (
+                float(rent_at(env, square, dice_total))
+                if env.properties[square].owner == player_id
+                else 0.0
+            )
+            later = (
+                float(_rent_under(env, ownership, houses, square, dice_total))
+                if ownership.get(square, env.properties[square].owner) == player_id
+                else 0.0
+            )
+            total += probability * (later - now)
+    return total
+
+
+def acquisition_income(env, player_id: int, square: int, turns: int = 1) -> float:
+    """Expected rent per turn that acquiring ``square`` adds to this player.
+
+    Net worth prices a deed at 2.5x its list price whatever it earns, so a
+    policy that scores only net worth cannot tell Boardwalk from a railroad,
+    or a third orange from a second brown. This is the missing half: the rent
+    the deed actually turns over, including the base-rent doubling it triggers
+    on deeds we already hold when it closes their group, and the railroad and
+    utility counts it steps up.
+
+    Rent we stop *paying* is counted too, so taking a deed off an opponent is
+    valued at both ends.
+    """
+
+    group = group_of(square)
+    affected = frozenset(group)
+    ownership = {square: player_id}
+    total = _collected_delta(env, player_id, affected, ownership, {}, turns)
+
+    owner = env.properties[square].owner
+    if owner is not None and owner != player_id:
+        for (item, dice_total), probability in landings(env.players[player_id], turns):
+            if item == square:
+                total += probability * float(rent_at(env, item, dice_total))
+    return total
+
+
+def improvement_income(env, square: int, houses_after: int, turns: int = 1) -> float:
+    """Expected rent per turn that developing ``square`` adds to its owner."""
+
+    owner = env.properties[square].owner
+    if owner is None:
+        return 0.0
+    return _collected_delta(
+        env, owner, frozenset((square,)), {}, {square: houses_after}, turns
+    )
+
+
 def income(env, player_id: int, turns: int = 1) -> float:
     """Expected rent this player collects from live opponents."""
 
@@ -223,8 +345,11 @@ def income(env, player_id: int, turns: int = 1) -> float:
 
 
 __all__ = [
+    "acquisition_income",
     "exposure",
+    "exposure_if_free",
     "group_of",
+    "improvement_income",
     "income",
     "income_by_square",
     "is_real_estate",

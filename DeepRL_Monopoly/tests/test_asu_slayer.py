@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import random
 import unittest
 
@@ -9,7 +10,11 @@ from ASU_FROZEN_TEACHER.evaluate import (
     parse_agent_spec,
 )
 from ASU_SLAYER.board import (
+    acquisition_income,
     exposure,
+    exposure_if_free,
+    improvement_income,
+    income,
     income_by_square,
     landings,
     rent_at,
@@ -26,8 +31,20 @@ from ASU_SLAYER.scoring import (
     mortgage_loss,
 )
 from ASU_SLAYER.search import SearchConfig, SlayerRolloutV1
-from monopoly_game_engine.actions import OFFSETS, PROPERTY_IDS, ActionType
-from monopoly_game_engine.constants import COLOR_GROUPS, PROPERTIES, REAL_ESTATE_IDS
+from monopoly_game_engine.actions import (
+    AUCTION_ACTION_TO_INCREMENT,
+    OFFSETS,
+    PROPERTY_IDS,
+    ActionType,
+    AuctionAction,
+)
+from monopoly_game_engine.constants import (
+    COLOR_GROUPS,
+    JAIL_SQUARE,
+    NUM_PLAYERS,
+    PROPERTIES,
+    REAL_ESTATE_IDS,
+)
 from monopoly_game_engine.env import MonopolyEnv
 from monopoly_game_engine.state import Property
 
@@ -100,6 +117,202 @@ class BoardMathTest(unittest.TestCase):
         env.properties[1].owner = 0
         env.properties[1].mortgaged = True
         self.assertEqual(rent_at(env, 1), 0)
+
+
+class JailExposureTest(unittest.TestCase):
+    """``exposure`` measures staying in jail; the decision is about leaving."""
+
+    def _hostile(self):
+        env = fresh_env()
+        for colour in ("orange", "red", "yellow"):
+            for square in COLOR_GROUPS[colour]:
+                prop = env.properties[square]
+                prop.owner = 1
+                env.players[1].properties.append(prop)
+        env._update_monopolies()
+        for colour in ("orange", "red", "yellow"):
+            for square in COLOR_GROUPS[colour]:
+                env.properties[square].houses = 5
+        env.players[0].position = JAIL_SQUARE
+        return env
+
+    def test_the_two_agree_for_a_player_who_is_not_in_jail(self):
+        env = self._hostile()
+        env.players[0].in_jail = False
+        self.assertAlmostEqual(
+            exposure(env, 0, 1)[0], exposure_if_free(env, 0, 1)[0], places=9
+        )
+
+    def test_the_in_jail_figure_is_deflated_by_the_cell(self):
+        env = self._hostile()
+        env.players[0].in_jail = True
+        jailed = exposure(env, 0, 1)[0]
+        free = exposure_if_free(env, 0, 1)[0]
+        self.assertGreater(free, 5 * jailed)
+
+    def test_the_old_measurement_could_never_reach_the_threshold(self):
+        """2820/36 = 78.33 is a hard ceiling, and the default threshold is 95.
+
+        A jailed player with fewer than ``MAX_JAIL_TURNS - 1`` turns served
+        only moves on a double, so from square 10 the reachable squares are
+        12, 14, 16, 18, 20 and 22 at one roll in thirty-six each. Summing the
+        largest rent each can carry bounds the expectation outright.
+        """
+
+        # Not a behavioural claim about the fixed code — a proof about the old
+        # measurement, kept so the branch can never silently go dead again.
+        reachable = ((12, 2), (14, 4), (16, 6), (18, 8), (20, 10), (22, 12))
+        ceiling = 0.0
+        for square, dice in reachable:
+            data = PROPERTIES.get(square)
+            if data is None:
+                continue
+            if data["color"] == "utility":
+                ceiling += data["rent"][1] * dice
+            elif data["color"] == "railroad":
+                ceiling += data["rent"][3]
+            else:
+                ceiling += data["rent"][5]
+        ceiling /= 36.0
+        self.assertAlmostEqual(ceiling, 2820 / 36, places=6)
+        self.assertLess(ceiling, DEFAULT_CONFIG.jail_exposure_threshold)
+
+        # And no board, however hostile, can beat that bound in practice.
+        env = fresh_env()
+        for square in PROPERTY_IDS:
+            prop = env.properties[square]
+            prop.owner = 1
+            env.players[1].properties.append(prop)
+        env._update_monopolies()
+        for square in REAL_ESTATE_IDS:
+            env.properties[square].houses = 5
+        env.players[0].position = JAIL_SQUARE
+        env.players[0].in_jail = True
+        self.assertLessEqual(exposure(env, 0, 1)[0], ceiling + 1e-9)
+
+
+class RentFlowTest(unittest.TestCase):
+    """The rent terms must equal the real change in ``income()``."""
+
+    def _mixed_board(self, seed: int):
+        env = fresh_env(seed)
+        rnd = random.Random(seed)
+        for square in PROPERTY_IDS:
+            owner = rnd.choice([None, 0, 1, 2, 3])
+            if owner is not None:
+                prop = env.properties[square]
+                prop.owner = owner
+                env.players[owner].properties.append(prop)
+        env._update_monopolies()
+        for square in REAL_ESTATE_IDS:
+            if env.properties[square].is_monopoly and rnd.random() < 0.5:
+                env.properties[square].houses = rnd.choice([1, 2, 3, 4, 5])
+        for square in PROPERTY_IDS:
+            if env.properties[square].houses == 0 and rnd.random() < 0.15:
+                env.properties[square].mortgaged = True
+        for player in env.players:
+            player.position = rnd.randrange(40)
+        return env
+
+    def test_acquisition_income_matches_a_realised_income_change(self):
+        for seed in (0, 1, 2):
+            env = self._mixed_board(seed)
+            for square in PROPERTY_IDS:
+                for pid in range(NUM_PLAYERS):
+                    if env.properties[square].owner == pid:
+                        continue
+                    with self.subTest(seed=seed, square=square, pid=pid):
+                        avoided = 0.0
+                        owner = env.properties[square].owner
+                        if owner is not None:
+                            for (item, dice), p in landings(env.players[pid], 1):
+                                if item == square:
+                                    avoided += p * rent_at(env, item, dice)
+                        before = income(env, pid, 1)
+                        clone = copy.deepcopy(env)
+                        prop = clone.properties[square]
+                        if prop.owner is not None:
+                            clone.players[prop.owner].properties.remove(prop)
+                        prop.owner = pid
+                        clone.players[pid].properties.append(prop)
+                        clone._update_monopolies()
+                        self.assertAlmostEqual(
+                            acquisition_income(env, pid, square, 1),
+                            (income(clone, pid, 1) - before) + avoided,
+                            places=9,
+                        )
+
+    def test_acquiring_a_deed_you_already_hold_changes_nothing(self):
+        env = self._mixed_board(0)
+        for square in PROPERTY_IDS:
+            owner = env.properties[square].owner
+            if owner is not None:
+                self.assertEqual(acquisition_income(env, owner, square, 1), 0.0)
+
+    def test_closing_a_group_is_worth_more_than_the_deed_alone(self):
+        """Completing a colour group doubles base rent on the deeds held."""
+
+        env = fresh_env()
+        first, second = COLOR_GROUPS["brown"]
+        for player in env.players:
+            player.position = 0
+        alone = acquisition_income(env, 0, first, 1)
+
+        prop = env.properties[second]
+        prop.owner = 0
+        env.players[0].properties.append(prop)
+        env._update_monopolies()
+        closing = acquisition_income(env, 0, first, 1)
+        self.assertGreater(closing, alone)
+
+    def test_improvement_income_matches_a_realised_income_change(self):
+        env = fresh_env()
+        for square in COLOR_GROUPS["orange"]:
+            prop = env.properties[square]
+            prop.owner = 0
+            env.players[0].properties.append(prop)
+        env._update_monopolies()
+        for player in env.players:
+            player.position = 11
+        for square in COLOR_GROUPS["orange"]:
+            for level in (1, 2, 3, 4, 5):
+                with self.subTest(square=square, level=level):
+                    clone = copy.deepcopy(env)
+                    clone.properties[square].houses = level
+                    self.assertAlmostEqual(
+                        improvement_income(env, square, level, 1),
+                        income(clone, 0, 1) - income(env, 0, 1),
+                        places=9,
+                    )
+
+    def test_the_measured_default_horizon_is_zero(self):
+        """Exact machinery, measured neutral — so it ships off.
+
+        Capitalising rent flow into the greedy objective is the obvious
+        remedy for the capped-game weakness, and it does not work: over 250
+        seed-clusters and 2,000 games per arm a horizon of 10 scored -0.10pp
+        (95% CI -1.71..+1.51) and a horizon of 20 scored +0.30pp
+        (CI -1.57..+2.17). The interval is tight enough to bound the effect
+        near zero rather than merely fail to detect one.
+        """
+
+        self.assertEqual(DEFAULT_CONFIG.rent_horizon, 0.0)
+
+    def test_a_zero_horizon_reproduces_the_pure_net_worth_objective(self):
+        env = fresh_env()
+        env.players[0].position = 0
+        priced = SlayerV1(0, DEFAULT_CONFIG.evolve(rent_horizon=0.0))
+        for square in PROPERTY_IDS:
+            self.assertEqual(
+                priced._acquire_value(env, square),
+                acquisition_gain(env, 0, square, include_denial=False)
+                * development_outlook(env, 0, square)
+                + DEFAULT_CONFIG.denial_fraction
+                * max(
+                    acquisition_gain(env, rival, square, include_denial=False)
+                    for rival in (1, 2, 3)
+                ),
+            )
 
 
 class DeltaTest(unittest.TestCase):
@@ -393,6 +606,50 @@ class ReserveTest(unittest.TestCase):
         # Boardwalk is the most expensive deed; starting cash must still clear it.
         self.assertTrue(agent._affordable(env, PROPERTIES[39]["price"], reserve))
 
+    def test_the_measured_default_reserve_is_zero(self):
+        """A solvency reserve is a losing trade in this engine.
+
+        Running out of cash never bankrupts a player directly: unpaid rent
+        becomes a debt, the rescue menu opens, and ``DECLARE_BANKRUPT`` is
+        only legal once nothing is left to liquidate. Being short therefore
+        costs 1.5 net worth per dollar mortgaged — exactly what the unspent
+        dollar would have earned buying a deed, with certainty.
+
+        Removing it together with the auction step fix is worth +11.60pp
+        pooled (95% CI +8.43..+14.77) over 250 seed-clusters and 2,000 games,
+        across three seed blocks and two lineups. See ``SlayerConfig``.
+        """
+
+        self.assertEqual(DEFAULT_CONFIG.reserve_floor, 0.0)
+        self.assertEqual(DEFAULT_CONFIG.threat_multiple, 0.0)
+
+    def test_a_zero_threat_multiple_skips_the_quantile_entirely(self):
+        """The short circuit must not change the number it returns."""
+
+        env = fresh_env()
+        for square in COLOR_GROUPS["orange"]:
+            prop = env.properties[square]
+            prop.owner = 1
+            env.players[1].properties.append(prop)
+        env._update_monopolies()
+        for square in COLOR_GROUPS["orange"]:
+            env.properties[square].houses = 4
+        env.players[0].position = 13
+
+        self.assertEqual(SlayerV1(0)._reserve(env), 0.0)
+        # The same config with the multiple restored must still price the threat.
+        threatened = SlayerV1(0, DEFAULT_CONFIG.evolve(threat_multiple=1.0))
+        self.assertGreater(threatened._reserve(env), 0.0)
+
+    def test_a_zero_reserve_can_never_refuse_a_legal_purchase(self):
+        """``BUY_PROPERTY`` is only legal when the price is affordable."""
+
+        env = fresh_env()
+        agent = SlayerV1(0)
+        for price in (60, 200, 400):
+            env.players[0].cash = price
+            self.assertTrue(agent._affordable(env, float(price), 0.0))
+
     def test_reserve_ignores_mortgage_capacity(self):
         """Counting liquidation as cash created a no-assets-no-credit trap."""
 
@@ -458,7 +715,18 @@ class DevelopmentOutlookTest(unittest.TestCase):
 
 
 class ActiveLiquidationTest(unittest.TestCase):
-    """Refusing to spend cannot recover cash; only raising it can."""
+    """Refusing to spend cannot recover cash; only raising it can.
+
+    The recovery rule exists to claw cash back up to the solvency reserve, so
+    it is only meaningful when there is a reserve. The measured default is now
+    zero (see ``ReserveTest``), which makes ``_raise_cash_action`` a no-op, so
+    every test here restores the pre-measurement reserve explicitly rather than
+    leaning on the shipped default.
+    """
+
+    LIQUIDATING = DEFAULT_CONFIG.evolve(
+        active_liquidation=True, reserve_floor=50.0, threat_multiple=1.0
+    )
 
     def _threatened(self):
         """Us cash-poor and holding deeds, an opponent with a developed group."""
@@ -487,7 +755,7 @@ class ActiveLiquidationTest(unittest.TestCase):
     def test_mortgages_when_cash_is_under_the_reserve(self):
         env, seat = self._threatened()
         self._give(env, seat, [COLOR_GROUPS["brown"][0], COLOR_GROUPS["pink"][0]])
-        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        agent = SlayerV1(seat, self.LIQUIDATING)
         self.assertLess(env.players[seat].cash, agent._reserve(env))
         legal = set(env.get_allowed_actions(seat))
         action = agent._raise_cash_action(env, legal)
@@ -498,14 +766,14 @@ class ActiveLiquidationTest(unittest.TestCase):
         env, seat = self._threatened()
         self._give(env, seat, [COLOR_GROUPS["brown"][0]])
         env.players[seat].cash = 5000
-        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        agent = SlayerV1(seat, self.LIQUIDATING)
         legal = set(env.get_allowed_actions(seat))
         self.assertIsNone(agent._raise_cash_action(env, legal))
 
     def test_never_mortgages_a_deed_inside_a_monopoly(self):
         env, seat = self._threatened()
         self._give(env, seat, list(COLOR_GROUPS["brown"]))
-        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        agent = SlayerV1(seat, self.LIQUIDATING)
         legal = set(env.get_allowed_actions(seat))
         action = agent._raise_cash_action(env, legal)
         # Brown is our only holding and it is a complete group, so nothing may go.
@@ -516,7 +784,7 @@ class ActiveLiquidationTest(unittest.TestCase):
         cheap = COLOR_GROUPS["brown"][0]
         earner = 5  # Reading Railroad, opponents land on it far more often
         self._give(env, seat, [cheap, earner])
-        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        agent = SlayerV1(seat, self.LIQUIDATING)
         legal = set(env.get_allowed_actions(seat))
         earned = income_by_square(env, seat, 1)
         self.assertGreater(earned.get(earner, 0.0), earned.get(cheap, 0.0))
@@ -530,7 +798,7 @@ class ActiveLiquidationTest(unittest.TestCase):
         self._give(
             env, seat, [COLOR_GROUPS["brown"][0], COLOR_GROUPS["pink"][0], 5, 15]
         )
-        agent = SlayerV1(seat, DEFAULT_CONFIG.evolve(active_liquidation=True))
+        agent = SlayerV1(seat, self.LIQUIDATING)
         seen = []
         for _step in range(40):
             legal = set(env.get_allowed_actions(seat))
@@ -558,6 +826,60 @@ class ActiveLiquidationTest(unittest.TestCase):
         agent = SlayerV1(seat, DEFAULT_CONFIG)
         legal = set(env.get_allowed_actions(seat))
         self.assertIsNone(agent._raise_cash_action(env, legal))
+
+
+class AuctionTest(unittest.TestCase):
+    """Bidders leave only by passing, so the smallest raise wins as often."""
+
+    def _contested(self, high_bid: int = 0):
+        env = fresh_env()
+        seat = env.active_player_id()
+        env.phase = "auction"
+        env.auction_property_id = 39  # Boardwalk, so the ceiling is generous
+        env.auction_bidders = [pid for pid in env.turn_order]
+        env.auction_current_pid = seat
+        env.auction_high_bid = high_bid
+        env.auction_high_bidder = None if high_bid == 0 else (seat + 1) % 4
+        return env, seat
+
+    def test_the_measured_default_step_is_the_smallest_increment(self):
+        """A coarse step overpays on auctions that were already won.
+
+        Raising by the largest increment reaches the same terminal price as
+        raising by the smallest, because the only way out of the engine's
+        auction is ``PASS``. Measured with the zero reserve, the pair is worth
+        +11.60pp pooled (95% CI +8.43..+14.77). See ``SlayerConfig``.
+        """
+
+        self.assertEqual(DEFAULT_CONFIG.auction_step_fraction, 0.0)
+
+        env, seat = self._contested()
+        legal = set(env.get_allowed_actions(seat))
+        action = SlayerV1(seat).choose_action(env)
+        self.assertIn(action, legal)
+        self.assertEqual(
+            AUCTION_ACTION_TO_INCREMENT[AuctionAction(action)],
+            min(AUCTION_ACTION_TO_INCREMENT.values()),
+        )
+
+    def test_the_old_coarse_step_bid_far_more_for_the_same_deed(self):
+        env, seat = self._contested()
+        legal = set(env.get_allowed_actions(seat))
+        coarse = SlayerV1(seat, DEFAULT_CONFIG.evolve(auction_step_fraction=0.18))
+        coarse_action = coarse.choose_action(env)
+        fine_action = SlayerV1(seat).choose_action(env)
+        self.assertIn(coarse_action, legal)
+        self.assertGreater(
+            AUCTION_ACTION_TO_INCREMENT[AuctionAction(coarse_action)],
+            AUCTION_ACTION_TO_INCREMENT[AuctionAction(fine_action)],
+        )
+
+    def test_it_still_passes_once_the_ceiling_is_reached(self):
+        env, seat = self._contested(high_bid=1200)
+        env.players[seat].cash = 5000
+        self.assertEqual(
+            SlayerV1(seat).choose_action(env), int(AuctionAction.PASS)
+        )
 
 
 class TradeTest(unittest.TestCase):
@@ -613,6 +935,112 @@ class TradeTest(unittest.TestCase):
         legal = {int(ActionType.ACCEPT_TRADE), int(ActionType.DECLINE_TRADE)}
         decision = SlayerV1(seat)._incoming_trade_action(env, legal)
         self.assertEqual(decision, int(ActionType.DECLINE_TRADE))
+
+
+class GroupCompletionOverrideTest(unittest.TestCase):
+    """The arm-D port: a group-closing deed outranks the solvency reserve.
+
+    The override only ever removed the reserve's veto over a purchase, so it
+    can only do work while a reserve exists. Now that the measured default
+    reserve is zero, ``_affordable(price, 0)`` reduces to ``price <= cash`` —
+    which ``BUY_PROPERTY`` legality already guarantees — and the override is
+    subsumed entirely. These tests therefore restore the pre-measurement
+    reserve to keep exercising the mechanism, and the last test pins the fact
+    that it is now inert under the shipped defaults.
+    """
+
+    RESERVED = DEFAULT_CONFIG.evolve(reserve_floor=50.0, threat_multiple=1.0)
+    ARM = RESERVED.evolve(group_completion_override=True)
+
+    def _cash_starved_on_the_last_brown(self, owner_of_the_sibling: int):
+        """Land the seat on a brown deed it can afford but the reserve refuses.
+
+        Brown costs 60 and the restored reserve floors at 50 on an undeveloped
+        board, so 100 in cash is affordable to the bank and unaffordable to the
+        gate.
+        """
+
+        env = fresh_env()
+        seat = env.active_player_id()
+        first, second = COLOR_GROUPS["brown"]
+        env.properties[first].owner = owner_of_the_sibling
+        env.players[owner_of_the_sibling].properties.append(env.properties[first])
+        env._update_monopolies()
+        env.phase = "post_roll"
+        env.has_rolled = True
+        env.players[seat].position = second
+        env.players[seat].cash = 100
+        return env, seat
+
+    def test_the_reserve_alone_would_refuse_the_group_closing_deed(self):
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=0)
+        self.assertIn(int(ActionType.BUY_PROPERTY), env.get_allowed_actions(seat))
+        policy = SlayerV1(seat, self.RESERVED)
+        self.assertNotEqual(policy.choose_action(env), int(ActionType.BUY_PROPERTY))
+        self.assertEqual(policy.override_fires, 0)
+
+    def test_the_override_buys_the_deed_that_closes_our_group(self):
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=0)
+        policy = SlayerV1(seat, self.ARM)
+        self.assertEqual(policy.choose_action(env), int(ActionType.BUY_PROPERTY))
+        self.assertEqual(policy.override_fires, 1)
+
+    def test_the_override_denies_a_group_one_opponent_would_close(self):
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=1)
+        policy = SlayerV1(seat, self.ARM)
+        self.assertEqual(policy.choose_action(env), int(ActionType.BUY_PROPERTY))
+        self.assertEqual(policy.override_fires, 1)
+
+    def test_a_group_split_between_two_opponents_is_not_a_denial(self):
+        env = fresh_env()
+        seat = 0
+        squares = COLOR_GROUPS["lightblue"]
+        for rival, square in zip((1, 2), squares[:2]):
+            env.properties[square].owner = rival
+        policy = SlayerV1(seat, self.ARM)
+        self.assertFalse(policy._closes_or_denies_group(env, squares[2]))
+
+    def test_railroads_and_utilities_are_excluded(self):
+        env = fresh_env()
+        seat = 0
+        for group in ("railroad", "utility"):
+            squares = COLOR_GROUPS[group]
+            for square in squares[1:]:
+                env.properties[square].owner = seat
+            policy = SlayerV1(seat, self.ARM)
+            self.assertFalse(
+                policy._closes_or_denies_group(env, squares[0]),
+                f"{group} cannot be built on, so the reserve keeps its veto",
+            )
+
+    def test_the_override_is_off_by_default(self):
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=0)
+        self.assertFalse(DEFAULT_CONFIG.group_completion_override)
+        self.assertFalse(SlayerV1(seat)._closes_or_denies_group(env, 3))
+
+    def test_the_override_never_overdraws_the_bank(self):
+        """BUY is illegal below the price, so the override cannot spend cash we
+        do not have — it only ignores the reserve held on top of the price."""
+
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=0)
+        env.players[seat].cash = 10
+        self.assertNotIn(int(ActionType.BUY_PROPERTY), env.get_allowed_actions(seat))
+        action = SlayerV1(seat, self.ARM).choose_action(env)
+        self.assertIn(action, env.get_allowed_actions(seat))
+
+    def test_the_zero_reserve_subsumes_the_override(self):
+        """Under the shipped defaults the override can no longer change a buy.
+
+        The scenario that motivated it — legal at the bank, refused by the gate
+        — cannot arise once the reserve is zero, so the default policy already
+        makes the purchase the override was invented to force.
+        """
+
+        env, seat = self._cash_starved_on_the_last_brown(owner_of_the_sibling=0)
+        self.assertEqual(DEFAULT_CONFIG.reserve_floor, 0.0)
+        plain = SlayerV1(seat)
+        self.assertEqual(plain.choose_action(env), int(ActionType.BUY_PROPERTY))
+        self.assertEqual(plain.override_fires, 0)
 
 
 class RegistrationTest(unittest.TestCase):
