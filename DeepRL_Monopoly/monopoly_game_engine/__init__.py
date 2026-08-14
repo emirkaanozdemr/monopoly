@@ -12,20 +12,53 @@ Quick start
 >>> from monopoly_game_engine import train_ppo, train_ddqn, evaluate_agent
 >>> agent, history = train_ppo(hybrid=True, n_games=2000)
 >>> results = evaluate_agent(agent, is_ppo=True, n_games=2000)
+
+The simulator itself needs only numpy; torch is a training dependency. The
+names that pull it in — the agents, ``train``/``evaluate`` and the three
+helpers below — are therefore resolved on first attribute access rather than
+at import, so that playing a game (the tournament submission does exactly
+this, in a container that has no torch) never imports torch at all.
 """
 
-import random
+import importlib
 
-import numpy as np
-import torch
-
-from .env          import MonopolyEnv
-from .agent_ppo    import PPOAgent
-from .agent_ddqn   import DDQNAgent
+from .env import MonopolyEnv
 from .agents_fixed import FPAgentA, FPAgentB, FPAgentC
-from .train        import train, evaluate
-from .state        import build_state_vector
-from .actions      import ACTION_SPACE_SIZE, action_to_description
+from .state import build_state_vector
+from .actions import ACTION_SPACE_SIZE, action_to_description
+
+
+_LAZY = {
+    "PPOAgent": ("agent_ppo", "PPOAgent"),
+    "DDQNAgent": ("agent_ddqn", "DDQNAgent"),
+    "train": ("train", "train"),
+    "evaluate": ("train", "evaluate"),
+}
+
+
+def __getattr__(name):
+    try:
+        module_name, attribute = _LAZY[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    value = getattr(importlib.import_module(f".{module_name}", __name__), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY))
+
+
+def _seed_everything(seed: int) -> None:
+    import random
+
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def train_ppo(
@@ -41,9 +74,10 @@ def train_ppo(
     **kwargs,
 ):
     """Train a PPO agent. Set hybrid=True for the hybrid approach."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    from .agent_ppo import PPOAgent
+    from .train import train
+
+    _seed_everything(seed)
     agent = PPOAgent(player_id=player_id, hybrid=hybrid, **kwargs)
     if resume_path is not None:
         agent.load(resume_path)
@@ -75,9 +109,10 @@ def train_ddqn(
     **kwargs,
 ):
     """Train a DDQN agent. Set hybrid=True for the hybrid approach."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    from .agent_ddqn import DDQNAgent
+    from .train import train
+
+    _seed_everything(seed)
     agent = DDQNAgent(player_id=player_id, hybrid=hybrid, **kwargs)
     if resume_path is not None:
         agent.load(resume_path)
@@ -98,6 +133,8 @@ def train_ddqn(
 
 def evaluate_agent(agent, is_ppo: bool, n_games: int = 2000, n_runs: int = 5):
     """Evaluate a trained agent against fixed-policy opponents."""
+    from .train import evaluate
+
     return evaluate(agent, is_ppo=is_ppo, n_games=n_games, n_runs=n_runs)
 
 

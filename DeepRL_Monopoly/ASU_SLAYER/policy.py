@@ -31,9 +31,12 @@ from monopoly_game_engine.env import (
 )
 
 from .board import (
-    exposure,
+    acquisition_income,
+    exposure_if_free,
     group_of,
+    improvement_income,
     income_by_square,
+    is_real_estate,
     owned_in_group,
     rent_quantile,
 )
@@ -56,27 +59,94 @@ _MAX_QUANTILE = 0.999
 class SlayerConfig:
     """Tunable weights.
 
-    The reserve is deliberately threat-proportional and holds no credit for
-    liquidation. An earlier design added a flat reserve while deeds were still
-    unowned and counted mortgage capacity as if it were cash; both were wrong
-    in the same direction. The flat term peaked on an empty board, which is
-    when buying is cheapest and rent is nearly zero, and the liquidation credit
-    created a trap: a strict reserve blocked purchases, owning nothing removed
-    the credit, and the gate tightened until the agent never invested at all.
+    Three defaults were measured to be actively harmful and are now zero.
+
+    ``reserve_floor`` / ``threat_multiple``
+        A solvency reserve is a losing trade in this engine, because running
+        out of cash never bankrupts anyone directly. ``_handle_landing``
+        records unpaid rent as a debt, ``get_allowed_actions`` opens the
+        rescue menu, and ``DECLARE_BANKRUPT`` only becomes legal once there is
+        nothing left to liquidate at all. Mortgaging to raise a dollar costs
+        2.5 net worth and returns 1 in cash, so being short costs 1.5x per
+        dollar -- and that is exactly what a deed *gains* per dollar, with
+        certainty, right now. The reserve paid a certain 1.5x to avoid a
+        probabilistic one.
+
+    ``auction_step_fraction``
+        A bidder leaves the engine's auction only by passing, so climbing in
+        the smallest legal increment reaches the same terminal price as
+        climbing in the largest -- and pays less for every auction that was
+        already won. A coarse step was a pure overpay.
+
+    Measured together, seat-balanced, over three seed blocks (0-24, 1000-1049,
+    2000-2049 -- the first selected the change, the other two did not):
+
+    ==================  ======  ======  ==========  ==============
+    lineup              old     new     delta       sign test
+    ==================  ======  ======  ==========  ==============
+    ``fixed-a/b/c``     70.8%   79.8%   +9.00pp     p = 0.0016
+    ``fixed-b/d/e``     54.0%   68.2%   +14.20pp    p < 0.0001
+    pooled              --      --      +11.60pp    p < 0.0001
+    ==================  ======  ======  ==========  ==============
+
+    Pooled 95% CI is +8.43..+14.77pp over 250 seed-clusters (2,000 games):
+    107 seeds improved, 32 regressed, 111 unchanged. The cluster is the seed
+    rather than the game on purpose -- the four seats inside one seed share a
+    board and a dice stream, so counting them as independent pairs overstates
+    the evidence, and a per-game McNemar on a single block read as high as
+    +15.5pp where the pooled estimate is +11.6pp.
+
+    The reserve machinery is kept rather than deleted: ``target_survival``,
+    ``expected_game_length`` and ``min_horizon`` still shape
+    ``_survival_quantile``, so raising ``threat_multiple`` restores the whole
+    behaviour for anyone who wants to re-measure it.
     """
 
-    reserve_floor: float = 50.0
+    reserve_floor: float = 0.0
     target_survival: float = 0.70
     expected_game_length: float = 45.0
     min_horizon: float = 4.0
-    threat_multiple: float = 1.0
+    threat_multiple: float = 0.0
     active_liquidation: bool = False
     build_reserve_fraction: float = 0.25
     auction_value_fraction: float = 0.62
     denial_fraction: float = 0.22
-    auction_step_fraction: float = 0.18
+    auction_step_fraction: float = 0.0
+    # Read against ``exposure_if_free``, which is what leaving jail actually
+    # costs. Under the old ``exposure`` call this threshold was unreachable by
+    # arithmetic (see ``_jail_action``); it now fires on about 4% of jail
+    # decisions, which is the top few percent of measured board hostility.
+    # Correctness fix, not a win-rate one: every threshold from 95 to 400 --
+    # and the old never-stay behaviour -- scored identically over 200 games.
     jail_exposure_threshold: float = 95.0
     trade_margin: float = 1.0
+    # Turns of rent flow capitalised into the value of an acquisition or a
+    # build. Zero reproduces the pure net-worth objective, and zero is what
+    # measurement supports: over 250 seed-clusters and 2,000 games per arm,
+    # a horizon of 10 scored -0.10pp (95% CI -1.71..+1.51) and a horizon of 20
+    # scored +0.30pp (CI -1.57..+2.17). The machinery is exact and tested --
+    # ``acquisition_income`` and ``improvement_income`` reproduce the realised
+    # change in ``income()`` to 1e-9 over randomised boards -- so it is kept
+    # for the search variant and for future work, but it is not switched on
+    # against evidence that bounds its effect to roughly +/-2pp.
+    #
+    # Why it does not help is worth recording: the policy already buys almost
+    # everything it lands on (164 of 186 offers taken, none refused for lack
+    # of value), so re-pricing deeds barely changes which deeds it ends up
+    # holding. The capped-game weakness is a deed *allocation* problem -- it
+    # finishes with 7 of 28 deeds and no way to trade into a monopoly -- not a
+    # deed *valuation* one.
+    rent_horizon: float = 0.0
+    # Buy a deed that closes our own colour group, or that is the last piece of
+    # a group a single opponent holds the rest of, on legality alone — the
+    # solvency reserve does not get a veto. Ported from the competition agent's
+    # arm-D result (+2.95pp, McNemar p=1.7e-08, n=2000 paired) and worth
+    # +2.92pp here. Inert under the defaults above: it only ever bypassed the
+    # reserve, and with the reserve at zero ``_affordable`` already reduces to
+    # the bank's own affordability test. Kept because it is the record of how
+    # the reserve defect was first found, and because restoring the reserve
+    # per-instance brings it back.
+    group_completion_override: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 < self.target_survival < 1.0:
@@ -107,8 +177,33 @@ class SlayerV1:
             raise ValueError(f"player_id must be in [0, {NUM_PLAYERS - 1}]")
         self.player_id = player_id
         self.config = config
+        self.override_fires = 0
 
     # ── Solvency ──────────────────────────────────────────────────────────
+
+    def _closes_or_denies_group(self, env, square: int) -> bool:
+        """Whether ``square`` is the last deed of a group, for us or for a rival.
+
+        The reserve exists to survive the next rent bill, but a deed that closes
+        a group re-prices every deed already held in it from 2.5x to 5.0x, and
+        that jump is worth more than the turn of solvency it costs. The mirror
+        case is denial: the last piece of a group one opponent otherwise
+        completes is the cheapest way to keep them off a 5.0x re-pricing.
+
+        Railroads and utilities are excluded — neither can be built on, so
+        closing them buys none of the development the reserve is risked for.
+        """
+
+        if not self.config.group_completion_override or not is_real_estate(square):
+            return False
+        siblings = [item for item in group_of(square) if item != square]
+        if all(env.properties[item].owner == self.player_id for item in siblings):
+            return True
+        return any(
+            all(env.properties[item].owner == rival for item in siblings)
+            for rival in range(NUM_PLAYERS)
+            if rival != self.player_id
+        )
 
     def _survival_quantile(self, env) -> float:
         """Per-turn rent quantile implied by surviving the rest of the game.
@@ -132,14 +227,27 @@ class SlayerV1:
     def _reserve(self, env) -> float:
         """Cash to keep back against the rent that could arrive next turn.
 
-        On an empty board almost every landing owes nothing, so the reserve is
-        the floor at any quantile and the agent still invests freely. It rises
-        on its own as opponents develop, and carries no term that depends on
-        what we own: crediting our own mortgage capacity here once created a
-        trap where owning nothing tightened the gate further.
+        Zero by default: see ``SlayerConfig``. The rent bill a reserve insures
+        against is not a ruin event in this engine -- it is a forced mortgage
+        at 1.5 net worth per dollar, which is precisely what the unspent dollar
+        would have earned had it bought a deed instead.
+
+        The term is threat-proportional and carries no credit for liquidation.
+        An earlier design added a flat reserve while deeds were still unowned
+        and counted mortgage capacity as if it were cash; both were wrong in
+        the same direction. The flat term peaked on an empty board, which is
+        when buying is cheapest and rent is nearly zero, and the liquidation
+        credit created a trap: a strict reserve blocked purchases, owning
+        nothing removed the credit, and the gate tightened until the agent
+        never invested at all.
         """
 
         config = self.config
+        if config.threat_multiple == 0.0:
+            # rent_quantile walks the whole landing distribution, so skipping it
+            # when it is about to be multiplied by zero is free. Behaviour is
+            # identical; this is the hot path on every decision.
+            return config.reserve_floor
         threat = rent_quantile(env, self.player_id, self._survival_quantile(env), 1)
         return config.reserve_floor + config.threat_multiple * threat
 
@@ -152,16 +260,28 @@ class SlayerV1:
     def _acquire_value(self, env, square: int) -> float:
         """What acquiring ``square`` is worth to us, as a decision quantity.
 
-        Two corrections to the raw net-worth delta. Deeds in a colour group an
+        Three corrections to the raw net-worth delta. Deeds in a colour group an
         opponent has already entered are discounted, because we can never build
         there and unbuilt rent is negligible. Against that, keeping a deed away
         from the opponent who wants it most is worth paying for, whether it is
         currently unowned or already theirs.
+
+        The third is rent. ``net_worth`` prices every unmortgaged deed at 2.5x
+        its list price no matter what it earns, so an objective built only on
+        it cannot separate a deed that turns over rent from one that merely
+        books value -- and four in five games are decided by elimination, which
+        is a rent-flow outcome, not a net-worth one. ``rent_horizon`` is how
+        many turns of that flow to capitalise; zero restores the pure
+        net-worth objective.
         """
 
         own = acquisition_gain(
             env, self.player_id, square, include_denial=False
         ) * development_outlook(env, self.player_id, square)
+        if self.config.rent_horizon:
+            own += self.config.rent_horizon * acquisition_income(
+                env, self.player_id, square, 1
+            )
         rivals = [
             other.player_id
             for other in env.players
@@ -207,18 +327,23 @@ class SlayerV1:
             gain = mortgage_loss(env, square) - cost
             candidates.append((gain, cost, action, unmortgage_share))
 
+        horizon = self.config.rent_horizon
         for index, square in enumerate(REAL_ESTATE_IDS):
             cost = float(PROPERTIES[square]["house_price"])
             action = OFFSETS["improve_hotel"] + index
             if action in legal:
-                candidates.append(
-                    (improvement_gain(env, square, True) - cost, cost, action, share)
-                )
+                gain = improvement_gain(env, square, True) - cost
+                if horizon:
+                    gain += horizon * improvement_income(env, square, 5, 1)
+                candidates.append((gain, cost, action, share))
             action = OFFSETS["improve_house"] + index
             if action in legal:
-                candidates.append(
-                    (improvement_gain(env, square, False) - cost, cost, action, share)
-                )
+                gain = improvement_gain(env, square, False) - cost
+                if horizon:
+                    gain += horizon * improvement_income(
+                        env, square, env.properties[square].houses + 1, 1
+                    )
+                candidates.append((gain, cost, action, share))
 
         candidates.extend(
             (gain, cost, action, 1.0)
@@ -309,10 +434,21 @@ class SlayerV1:
     # ── Phase handlers ────────────────────────────────────────────────────
 
     def _jail_action(self, env, legal: set[int]) -> int | None:
+        """Buy our way out of jail only while the board outside is cheap.
+
+        This used to call ``exposure``, which measures the state the player is
+        in -- and a jailed player mostly does not move, so the figure was the
+        cost of *staying*, not the cost of leaving, deflated by roughly ten.
+        It was also capped at 2820/36 = 78.33 by the six squares a double can
+        reach from the cell, so a threshold quoted in units of real rent could
+        never be met and the shelter branch was unreachable. ``exposure_if_free``
+        asks the question the decision actually poses.
+        """
+
         player = env.players[self.player_id]
         if not player.in_jail:
             return None
-        expected_out, _worst = exposure(env, self.player_id, 1)
+        expected_out, _worst = exposure_if_free(env, self.player_id, 1)
         # Jail is shelter once the board is expensive; leave while it is cheap.
         if expected_out >= self.config.jail_exposure_threshold:
             return None
@@ -374,6 +510,11 @@ class SlayerV1:
             for action in legal
             if action != int(AuctionAction.PASS)
         ]
+        # A bidder leaves the auction only by passing, so climbing in the
+        # smallest legal increment reaches the same terminal price as climbing
+        # in the largest -- and pays less for every auction that was already
+        # won. At the default fraction of zero this floors at 1 and always
+        # takes the cheapest raise.
         step_target = max(1.0, config.auction_step_fraction * ceiling)
         affordable = [
             (increment, action)
@@ -423,8 +564,14 @@ class SlayerV1:
                 square = env.players[self.player_id].position
                 price = float(PROPERTIES[square]["price"])
                 gain = self._acquire_value(env, square) - price
-                if gain > 0 and self._affordable(env, price, self._reserve(env)):
-                    return int(ActionType.BUY_PROPERTY)
+                if gain > 0:
+                    # BUY_PROPERTY is only legal when the player can afford the
+                    # price, so the override still cannot overdraw the bank.
+                    if self._closes_or_denies_group(env, square):
+                        self.override_fires += 1
+                        return int(ActionType.BUY_PROPERTY)
+                    if self._affordable(env, price, self._reserve(env)):
+                        return int(ActionType.BUY_PROPERTY)
             return int(ActionType.END_TURN)
 
         if env.phase in (PHASE_PRE_ROLL, PHASE_OUT_OF_TURN):

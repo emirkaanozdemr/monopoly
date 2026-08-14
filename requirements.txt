@@ -1,0 +1,4 @@
+# Tournament runtime only. The simulator needs numpy; torch is a training
+# dependency and monopoly_game_engine imports it lazily, so a game never
+# pulls it in.
+numpy>=2.0,<3
